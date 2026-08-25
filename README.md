@@ -2,7 +2,7 @@
 
 ### Multi-Agent Loan Portfolio Risk Intelligence System
 
-<img src="Docs/RiskForge_Architecture.png" width="250">
+<img src="Docs/RiskForge_Architecture.png" width="500" height="500">
 
 RiskForge is an **agentic AI platform** that analyzes a bank's loan portfolio across credit, interest rate, concentration, and regulatory compliance risk through four specialized agents — turning a natural-language question into an **auditable, source-attributed risk report**.
 
