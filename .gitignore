@@ -1,0 +1,42 @@
+# Python cache and generated files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Test, coverage, and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs and runtime output
+logs/
+**/logs/
+*.log
+
+# Local database
+Database/credit_risk.db
+
+# Local datasets and generated model artifacts
+Data/
+Models/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+Notebooks/catboost_info/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
