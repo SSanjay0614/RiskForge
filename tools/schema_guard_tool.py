@@ -1,7 +1,7 @@
 import json
 import re
 
-from llm import ollama_provider
+from llm.ollama_provider import ollama_provider
 
 from tools.base_tool import BaseTool
 
@@ -35,13 +35,48 @@ from the raw loan/borrower data, including:
   outstanding balance
 - Portfolio concentration (HHI), by sector (purpose) or region (addr_state)
 - Interest rate repricing gap, from each loan's term and issue date
+- Net interest income, net interest margin and earnings at risk, from each
+  loan's interest rate and a documented deposit assumption
+- Regulatory capital under Basel III: asset correlation (R), the capital
+  requirement factor (K), risk-weighted assets (RWA) and the 8% capital
+  reserve, computed from the modelled PD and LGD plus each loan's outstanding
+  balance using the Basel IRB Other Retail risk-weight formula
+- Compliance checks of the above against the thresholds in Risk_Limits
 
 Treat questions about these metrics (expected loss, PD, default probability,
-risk tier, concentration, HHI, repricing gap, interest rate risk, etc.) as
-ANSWERABLE, as long as the underlying raw loan/borrower data needed to
+risk tier, credit quality, risk profile, concentration, HHI, repricing gap,
+interest rate risk, net interest income, earnings at risk, regulatory capital,
+capital requirement, capital reserve, RWA, risk weight, Basel, limit breaches,
+etc.) as ANSWERABLE, as long as the underlying raw loan/borrower data needed to
 compute them is present in the schema below (it is). Do NOT mark these
 unanswerable just because they are not literal column names -- they are
 computed downstream by models and tools, not retrieved directly via SQL.
+
+In particular, "regulatory capital", "capital requirement", "RWA" and "Basel"
+questions ARE answerable. The schema does not need a regulatory-capital column:
+the Basel formula is implemented in Python and needs only outstanding_balance
+plus the modelled PD and LGD, all of which are available.
+
+The list of downstream metrics above is CLOSED -- those are the only metrics
+computed after retrieval. Risk vocabulary alone does NOT make a question
+answerable: the raw data the metric is built from must still be present in the
+schema. A question needing a data dimension the schema does not have is
+unanswerable no matter how it is phrased. Absent dimensions include currency
+and FX rates, market or fair value prices, collateral and recovery records,
+loan status / default / charge-off / delinquency outcomes, deposit account
+balances, employee or loan-officer data, credit-bureau scores other than the
+FICO range stored, and macroeconomic series. So "what is the FX exposure of the
+portfolio" is FALSE (no currency data) even though "exposure" is risk
+vocabulary, while "what is the expected loss on the portfolio" is TRUE.
+
+Note also that this is a loan portfolio, not a full bank balance sheet. There is
+no cash, no securities, no high-quality liquid assets, no equity or capital
+account and no collateral valuation. So bank-level ratios that need those --
+liquidity coverage ratio (LCR), net stable funding ratio (NSFR), CET1 or
+leverage ratio, collateral coverage, loan-to-value -- are FALSE. Do not treat
+`tot_coll_amt` (a credit-bureau collections amount owed) as collateral value.
+The one exception is the loan-to-deposit ratio, which IS computed downstream
+from the loan book plus the documented deposit assumption.
 IMPORTANT RULES:
 
 1. Mark is_answerable=true if the requested information can be obtained
@@ -84,21 +119,56 @@ IMPORTANT RULES:
    is missing from the schema, mark it false.
    
 8. Do NOT mark a question false merely because it asks for a computed risk
-   metric (expected loss, PD, LGD, risk tier, HHI, concentration, repricing
-   gap) rather than a raw column value -- see DOWNSTREAM COMPUTED METRICS
-   above.
-   
+   metric (expected loss, PD, LGD, risk tier, risk profile, credit quality,
+   HHI, concentration, repricing gap, interest rate risk, net interest income,
+   regulatory capital, capital requirement, RWA, risk weight, Basel) rather
+   than a raw column value -- see DOWNSTREAM COMPUTED METRICS above.
+
 9. Additionally, determine whether answering this question requires computing
-   risk metrics (expected loss, PD, LGD, concentration/HHI, regulatory capital)
-   on top of the retrieved data, or whether it's answerable directly from the
-   raw rows themselves (a count, a list, a simple lookup/filter). Set
-   requires_risk_analysis=true only if genuine risk computation is needed.
+   risk metrics on top of the retrieved data, or whether it's answerable
+   directly from the raw rows themselves (a count, a list, a simple
+   lookup/filter, an average of a stored column).
+
+   Set requires_risk_analysis=true whenever the question asks about risk,
+   creditworthiness or capital in ANY wording -- not only when it names a
+   metric exactly. Trigger words and phrases include:
+   risk, risky, riskiness, risk profile, risk analysis, risk assessment,
+   risk breakdown, credit quality, creditworthiness, how safe, how exposed,
+   expected loss, loss estimate, PD, probability of default, default
+   likelihood, LGD, loss given default, exposure at default, EAD, risk tier,
+   concentration, HHI, diversification, repricing, interest rate risk,
+   earnings at risk, net interest income, regulatory capital, capital
+   requirement, capital reserve, RWA, risk-weighted assets, risk weight,
+   Basel, compliance, limit breach.
+
+   "Show/give me the risk profile of X", "how risky is X", "what is the credit
+   quality of X" and "what is the regulatory capital for X" are all
+   requires_risk_analysis=true. Grade and sub_grade are stored columns, but a
+   question about the RISK of a graded population still needs the models -- do
+   NOT answer it from the letter grade alone.
+
+   Set requires_risk_analysis=false only when the question is satisfied by the
+   rows themselves with no risk metric involved.
 
    Examples:
    "How many loans have sub_grade B3?" -> requires_risk_analysis: false
    "List loans in California" -> requires_risk_analysis: false
+   "What is the average loan amount by purpose?" -> requires_risk_analysis: false
+   "Which state has the most loans?" -> requires_risk_analysis: false
    "What is our expected loss for California loans?" -> requires_risk_analysis: true
    "What is our concentration risk by sector?" -> requires_risk_analysis: true
+   "Show the risk profile of grade D and E loans issued in 2017." -> requires_risk_analysis: true
+   "What is the credit quality of 60-month loans?" -> requires_risk_analysis: true
+   "What is the regulatory capital requirement for loans under $10,000?" -> requires_risk_analysis: true
+   "How risky is our Texas book?" -> requires_risk_analysis: true
+
+10. A metric is answerable only if it is EITHER computable by SQL from the
+    columns listed in the schema, OR one of the DOWNSTREAM COMPUTED METRICS
+    named above. "Computed downstream" is not a general escape hatch -- the
+    downstream list is fixed and no other metric is implemented. Holding SOME
+    of a ratio's inputs is not enough: if its numerator or denominator does not
+    exist in the schema, mark it false. An outstanding balance alone does not
+    make every ratio with a balance in it answerable.
 
 Examples:
 
@@ -106,12 +176,27 @@ Question: "What is the average loan amount in California?"
 Schema contains loan_amnt and addr_state.
 -> true
 
-Question: "What percentage of loans are charged off?"
-Schema contains loan_status.
+Question: "What is the regulatory capital requirement for loans under $10,000?"
+Schema contains loan_amnt and outstanding_balance; PD and LGD are modelled
+downstream and the Basel IRB formula is implemented in Python.
+-> true, requires_risk_analysis: true
+
+Question: "Show the risk profile of grade D and E loans issued in 2017."
+Schema contains grade and issue_date; the risk metrics are computed downstream.
+-> true, requires_risk_analysis: true
+
+Question: "What percentage of loans have a FICO score above 700?"
+Schema contains fico_range_low and fico_range_high.
 -> true
 
 Question: "What was the loan exposure in 2025?"
-Schema contains loan amount but no date/year field.
+Schema contains loan amount and issue_date, but this portfolio's issue dates do
+not reach 2025.
+-> false
+
+Question: "Which loans were charged off last year?"
+Schema contains loan information but no loan status or default outcome -- the
+Notes state no default/payoff outcome is stored.
 -> false
 
 Question: "How many loans are in Wyoming?"
@@ -120,7 +205,19 @@ Schema contains addr_state.
 (Even if the database contains zero Wyoming loans.)
 
 Question: "What is the current market price of our loans?"
-Schema contains loan information but no market-price information. 
+Schema contains loan information but no market-price information.
+-> false
+
+Question: "What is the FX exposure of the portfolio?"
+Schema contains outstanding balances but no currency field, so there is no way
+to know which exposures are foreign-currency. "Exposure" here is not exposure
+at default.
+-> false
+
+Question: "What is the collateral coverage ratio of the portfolio?"
+Schema contains loan and balance amounts, but no collateral valuation, and
+collateral coverage is not one of the downstream computed metrics. The
+denominator does not exist.
 -> false
 
 Return ONLY a valid JSON object with no markdown, explanation, or additional text.

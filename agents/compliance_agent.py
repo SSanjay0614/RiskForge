@@ -34,6 +34,13 @@ METRIC_LOOKUP = {
         "getter": lambda state: state.credit_metrics.get("exposure_weighted_avg_lgd"),
         "direction": "min",
     },
+    "max_loan_to_deposit_ratio": {
+        "getter": lambda state: (
+            (state.rate_metrics.get("repricing_gap") or {}).get("loan_to_deposit_ratio")
+            if state.rate_metrics else None
+        ),
+        "direction": "max",
+    },
 }
 
 # All citations are fully hardcoded -- no retrieval involved anywhere in
@@ -56,6 +63,14 @@ BREACH_NOTES = {
         "limits; concentration risk is addressed under each bank's own risk appetite "
         "framework, and separately, for single-counterparty exposures, under Basel's "
         "Large Exposures framework (not applicable to sector-level retail concentration)."
+    ),
+    "max_loan_to_deposit_ratio": (
+        "Internal funding-risk threshold, not a Basel III limit -- Basel addresses funding "
+        "stability through the Net Stable Funding Ratio (NSFR) rather than a loan-to-deposit "
+        "cap. Note also that the deposit figure is a documented assumption: this portfolio "
+        "holds loans only, so the deposit book is modelled at a fixed multiple of the loan "
+        "book (see RepricingGapTool). The ratio is therefore illustrative of the check, not "
+        "an observed funding position."
     ),
 }
 

@@ -75,5 +75,15 @@ class CreditRiskAgent:
         return {
             "engineered_df": fe_result.engineered_df,
             "scored_df": el_result.scored_df,
-            "credit_metrics": el_result.model_dump(exclude={"scored_df"}),
+            "credit_metrics": {
+                **el_result.model_dump(exclude={"scored_df"}),
+                # The row counts ride along inside credit_metrics so the interface
+                # can explain why fewer loans were scored than were retrieved,
+                # instead of showing two numbers that silently disagree. Not part
+                # of ExpectedLossResult, which knows nothing about what was
+                # dropped upstream of it.
+                "rows_retrieved": fe_result.input_row_count,
+                "rows_dropped": fe_result.rows_dropped,
+                "dropped_reason_counts": fe_result.dropped_reason_counts,
+            },
         }

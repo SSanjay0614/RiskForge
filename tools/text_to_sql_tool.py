@@ -1,6 +1,6 @@
 import re
 
-from llm import ollama_provider
+from llm.ollama_provider import ollama_provider
 
 from tools.base_tool import BaseTool
 
@@ -28,7 +28,7 @@ Rules for the query:
 
 1. Generate exactly ONE SQLite SELECT statement.
 
-2. 2. Always SELECT every column from both Loans and Borrowers using a full join
+2. Always SELECT every column from both Loans and Borrowers using a full join
    on loan_id, written as JOIN Borrowers USING(loan_id) -- NOT
    "ON Loans.loan_id = Borrowers.loan_id", which duplicates the loan_id
    column in the result set. Never select only a subset of columns.

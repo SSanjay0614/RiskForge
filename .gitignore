@@ -36,6 +36,27 @@ Models/
 **/.ipynb_checkpoints/
 Notebooks/catboost_info/
 
+# Terraform -- state can contain the Aurora master password in plaintext,
+# and tfvars holds environment-specific values. Never commit either.
+# .terraform.lock.hcl is deliberately NOT listed: it pins provider versions and
+# their hashes, so it belongs in the repo.
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+tfplan
+*.tfplan
+tfplan.*
+plan.json
+crash.log
+crash.*.log
+
+# Cloud credentials and keys
+*.pem
+*.ppk
+
 # OS and editor files
 .DS_Store
 Thumbs.db

@@ -29,6 +29,35 @@ EMP_LENGTH_MAP = {
 
 TERM_MAP = {36: 0, 60: 1}  # SQLite stores term as raw months, not the CSV's string form
 
+# Categorical levels present in the training data, pinned here for the same
+# reason the frequency maps are loaded from artifacts rather than recomputed:
+# get_dummies on a runtime subset emits only the levels that subset happens to
+# contain, so the encoding would otherwise depend on batch composition.
+# home_ownership's ANY/NONE are folded into OTHER before encoding.
+TRAINING_CATEGORY_LEVELS = {
+    "verification_status": ["Not Verified", "Source Verified", "Verified"],
+    "home_ownership": ["MORTGAGE", "OTHER", "OWN", "RENT"],
+    "purpose": [
+        "car", "credit_card", "debt_consolidation", "educational",
+        "home_improvement", "house", "major_purchase", "medical", "moving",
+        "other", "renewable_energy", "small_business", "vacation", "wedding",
+    ],
+}
+
+EXPECTED_DUMMY_COLUMNS = [
+    f"{col}_{level}"
+    for col, levels in TRAINING_CATEGORY_LEVELS.items()
+    for level in levels
+]
+
+# Training used drop_first=True, which drops the alphabetically first level of
+# each column. Those become the reference category and are absent from the
+# saved model feature lists, so they are dropped here too -- explicitly, by
+# name, instead of positionally.
+DUMMY_BASELINE_COLUMNS = [
+    f"{col}_{levels[0]}" for col, levels in TRAINING_CATEGORY_LEVELS.items()
+]
+
 SUBGRADE_ORDER = [f"{g}{s}" for g in ["A", "B", "C", "D", "E", "F", "G"] for s in range(1, 6)]
 SUBGRADE_FLOAT_MAP = {sg: float(f"{i // 5 + 1}.{i % 5 + 1}") for i, sg in enumerate(SUBGRADE_ORDER)}
 
@@ -89,13 +118,45 @@ class FeatureEngineeringTool(BaseTool):
         df["installment_income_ratio"] = df["installment"] / (df["annual_inc"] + 1)
         df["loan_amount_income_ratio"] = df["loan_amnt"] / (df["annual_inc"] + 1)
 
+        # LGD-only features. Both sit on the PD leakage exclusion list in
+        # 01_feature_engineering.ipynb and are re-included for LGD alone,
+        # following 03_lgd_model.ipynb: the LGD population is already entirely
+        # defaulted loans, so these speak to how much is lost, not to whether
+        # default occurs. Neither name appears in the PD model's feature list,
+        # and ExpectedLossTool selects each model's features strictly by name,
+        # so the PD model cannot see either column.
+        #
+        # Training used total_rec_prncp, which this schema doesn't store, but
+        # it is exactly recoverable from what it does store: loan_amnt ==
+        # funded_amnt and funded_amnt - out_prncp == total_rec_prncp hold for
+        # every row of the source data.
+        df["prncp_repaid_ratio"] = (
+            df["loan_amnt"] - df["outstanding_balance"]
+        ) / (df["loan_amnt"] + 1)
+
+        # Also absent from this schema, but 0 is the correct value here rather
+        # than a fallback: entering settlement is a consequence of default, and
+        # only 6 of 169,940 non-defaulted loans in the source data carry the
+        # flag (0.004%).
+        df["debt_settlement_flag"] = 0
+
         df["delinq_flag"] = (df["mths_since_last_delinq"] < 12).astype(int)
         df["bankruptcy_flag"] = (df["pub_rec_bankruptcies"] > 0).astype(int)
         df["historical_delinquency_rate"] = df["delinq_2yrs"] / (df["total_acc"] + 1)
 
+        # drop_first=False so the emitted columns don't depend on which levels
+        # this batch contains; the fixed training baseline is removed below.
         df = pd.get_dummies(
-            df, columns=["verification_status", "home_ownership", "purpose"], drop_first=True
+            df,
+            columns=["verification_status", "home_ownership", "purpose"],
+            drop_first=False,
         )
+
+        for col in EXPECTED_DUMMY_COLUMNS:
+            if col not in df.columns:
+                df[col] = False  # level absent from this batch
+
+        df.drop(columns=DUMMY_BASELINE_COLUMNS, inplace=True)
 
         df["emp_length"] = df["emp_length"].map(EMP_LENGTH_MAP)
         df["term"] = df["term"].map(TERM_MAP)
@@ -120,7 +181,10 @@ class FeatureEngineeringTool(BaseTool):
         df["revol_bal_log"] = np.log1p(df["revol_bal"])
         df["tot_coll_amt_log"] = np.log1p(df["tot_coll_amt"])
         df["tot_cur_bal_log"] = np.log1p(df["tot_cur_bal"])
-        df.drop(columns=["annual_inc", "dti", "revol_bal", "tot_coll_amt", "tot_cur_bal"], inplace=True)
+        # dti is deliberately NOT dropped: the PD model uses dti_log, but the
+        # LGD model was trained on raw dti (see 03_lgd_model.ipynb), and each
+        # model's feature list is applied by name downstream.
+        df.drop(columns=["annual_inc", "revol_bal", "tot_coll_amt", "tot_cur_bal"], inplace=True)
 
         # SQLite stores dates as ISO text, unlike the CSV's 'Mon-YYYY' format --
         # standard parsing, no explicit format string needed.
@@ -141,6 +205,17 @@ class FeatureEngineeringTool(BaseTool):
         df["revol_util"] = df["revol_util"].fillna(0)
         df["emp_title_freq"] = df["emp_title_freq"].fillna(0)
         df["emp_length"] = df["emp_length"].fillna(0)
+
+        # PD interaction features, created in 02_modeling_evaluation.ipynb after
+        # 01's output was loaded -- so they belong here, downstream of the
+        # imputations above, which is the order the model was trained on.
+        df["revolutil_fico"] = df["revol_util"] * df["fico_score_origination"]
+        df["dti_loaninc_ratio"] = df["dti_log"] * df["loan_amount_income_ratio"]
+        df["accage_openacc"] = df["account_age_years"] * df["open_acc"]
+        df["emplen_verif"] = df["emp_length"] * df["verification_status_Verified"]
+        df["inst_inc_purpose_debtcon"] = (
+            df["installment_income_ratio"] * df["purpose_debt_consolidation"]
+        )
 
         before = len(df)
         df = df.dropna(subset=CLUSTER_COLS)

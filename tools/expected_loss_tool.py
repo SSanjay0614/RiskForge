@@ -3,6 +3,8 @@ import pandas as pd
 
 from tools.base_tool import BaseTool
 
+from utils.logger import logger
+
 from dmodels.expected_loss_result import ExpectedLossResult
 
 from config import (
@@ -53,14 +55,29 @@ class ExpectedLossTool(BaseTool):
             return "High"
         return "Very High"
 
-    def _align_features(self, df: pd.DataFrame, feature_names: list) -> pd.DataFrame:
+    def _align_features(
+        self, df: pd.DataFrame, feature_names: list, model_name: str
+    ) -> pd.DataFrame:
 
         df = df.copy()
 
         missing = [f for f in feature_names if f not in df.columns]
+
+        # Zero-filling silently is how train/serve skew hides: a feature the
+        # model was trained on becomes a constant 0 for every row and the
+        # predictions shift with nothing raised. predict_pd in
+        # 02_modeling_evaluation.ipynb warns on this; so does this.
+        if missing:
+            logger.warning(
+                f"{self.name} | {model_name} | filled {len(missing)} missing "
+                f"feature(s) with 0: {missing}"
+            )
+
         for f in missing:
             df[f] = 0
 
+        # Selecting strictly by name is also what keeps each model to its own
+        # feature set -- the LGD-only columns are invisible to the PD model.
         return df[feature_names]
 
     def run(self, loans: pd.DataFrame) -> ExpectedLossResult:
@@ -68,8 +85,8 @@ class ExpectedLossTool(BaseTool):
         if "exposure_at_default" not in loans.columns:
             raise ValueError("loans must include an 'exposure_at_default' column")
 
-        X_pd = self._align_features(loans, self.pd_feature_names)
-        X_lgd = self._align_features(loans, self.lgd_feature_names)
+        X_pd = self._align_features(loans, self.pd_feature_names, "PD")
+        X_lgd = self._align_features(loans, self.lgd_feature_names, "LGD")
 
         predicted_pd = self.pd_model.predict_proba(X_pd)[:, 1]
         predicted_lgd = self.lgd_model.predict(X_lgd).clip(0, 1)

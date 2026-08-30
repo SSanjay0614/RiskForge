@@ -1,0 +1,34 @@
+# RiskForge runtime dependencies, pinned to the versions the project is
+# developed and tested against. Python 3.9.
+#
+# The notebooks in Notebooks/ additionally use catboost, lightgbm and optuna for
+# the model-selection comparison; they are not needed to run the application, so
+# they are deliberately not pinned here.
+
+# --- Agent orchestration and LLM ---
+langgraph==0.6.11
+langchain-core==0.3.86
+langchain-ollama==0.3.10
+pydantic==2.11.7
+python-dotenv==1.1.1
+
+# --- Models and numerics ---
+# scikit-learn and xgboost are required even though no application module
+# imports them directly: the persisted .joblib artifacts unpickle into
+# CalibratedClassifierCV and XGBoost estimators, so both must be importable at
+# the exact versions the artifacts were written with.
+scikit-learn==1.6.1
+xgboost==2.1.4
+joblib==1.5.1
+pandas==2.3.1
+numpy==2.0.1
+scipy==1.13.1
+
+# --- Interface ---
+streamlit==1.50.0
+plotly==6.3.0
+
+# --- PDF risk memo ---
+reportlab==4.4.9
+matplotlib==3.9.1
+pillow==11.1.0
