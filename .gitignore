@@ -31,6 +31,10 @@ Database/credit_risk.db
 Data/
 Models/
 
+# SageMaker bundles built from Models/ -- regenerate with
+# Deploy/sagemaker/build_artifacts.py rather than committing a booster
+Deploy/sagemaker/dist/
+
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
@@ -46,9 +50,11 @@ Notebooks/catboost_info/
 *.tfstate.*
 *.tfvars
 *.tfvars.json
-tfplan
+# tfplan* rather than tfplan/tfplan.*: a saved plan named tfplan-phase8 matched
+# neither, and a plan file carries the full resource attributes it is about to
+# write -- not something to push to a public repo by accident.
+tfplan*
 *.tfplan
-tfplan.*
 plan.json
 crash.log
 crash.*.log
@@ -61,3 +67,15 @@ crash.*.log
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Lambda deployment packages and the fetched RDS CA bundle -- rebuild with
+# Deploy/lambda/build.py rather than committing zips
+Deploy/lambda/dist/
+Deploy/lambda/build/
+Deploy/lambda/shared/rds-global-bundle.pem
+
+# The Fargate image's build context, assembled by Deploy/fargate/stage.py. It is
+# a copy of files that are already in this repository plus two joblib frequency
+# maps from the ignored Models/ -- so committing it would both duplicate tracked
+# source and push artifacts that are deliberately untracked.
+Deploy/fargate/build/

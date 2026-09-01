@@ -1,0 +1,104 @@
+-- Phase 6, step 1 of 3: schema only, no data, no indexes.
+--
+-- Types are a faithful mapping of the SQLite schema in Database/seed_db.py, not
+-- a redesign. Every declared type in the source was checked against what SQLite
+-- actually stored (`SELECT DISTINCT typeof(col)`) before this was written, and
+-- all 45 columns matched their declaration -- no integers hiding in REAL
+-- columns, so nothing here needs a defensive widening.
+--
+-- Two mapping choices are worth stating:
+--
+--   SQLite REAL -> DOUBLE PRECISION, not REAL. PostgreSQL's REAL is 4-byte
+--   single precision; SQLite's is 8-byte. Using REAL would silently round every
+--   monetary and rate column on load.
+--
+--   Dates stay TEXT. They are ISO-8601 ('2013-10-01'), which sorts
+--   lexicographically in exactly chronological order, so every comparison and
+--   MIN/MAX in the codebase keeps working untouched. Nothing in tools/ or
+--   agents/ calls a SQL date function -- all date arithmetic happens in pandas
+--   after retrieval (tools/feature_engineering_tool.py, repricing_gap_tool.py),
+--   so a DATE column would buy no correctness here while adding a type change
+--   that cannot be verified until the app is repointed at Postgres. When it is:
+--   ALTER TABLE loans ALTER COLUMN issue_date TYPE date USING issue_date::date;
+--
+-- Identifiers are created UNQUOTED and therefore fold to lowercase. Every SQL
+-- string in the repo writes bare `FROM Loans` / `JOIN Borrowers USING(loan_id)`
+-- with no double quotes (checked across tools/, agents/, Frontend/, Database/),
+-- and PostgreSQL folds those the same way -- so `FROM Loans` resolves to this
+-- `loans` table and no application query has to change. Creating "Loans"
+-- quoted would have forced every caller to quote it too, forever.
+--
+-- NOT NULL is applied wherever the source data has no nulls, which is all of
+-- loans and all but seven columns of borrowers (verified by counting nulls per
+-- column before writing this). The SQLite schema declared almost nothing NOT
+-- NULL; tightening it here means a partial or misaligned load fails loudly
+-- instead of landing quietly and being discovered later in a risk number.
+
+BEGIN;
+
+DROP TABLE IF EXISTS borrowers;
+DROP TABLE IF EXISTS loans;
+DROP TABLE IF EXISTS risk_limits;
+
+CREATE TABLE loans (
+    loan_id             TEXT             PRIMARY KEY,
+    loan_amnt           DOUBLE PRECISION NOT NULL,
+    term                INTEGER          NOT NULL,
+    int_rate            DOUBLE PRECISION NOT NULL,
+    installment         DOUBLE PRECISION NOT NULL,
+    grade               TEXT             NOT NULL,
+    sub_grade           TEXT             NOT NULL,
+    purpose             TEXT             NOT NULL,
+    issue_date          TEXT             NOT NULL,
+    outstanding_balance DOUBLE PRECISION NOT NULL,
+    on_payment_plan     INTEGER          NOT NULL,
+    entered_hardship    INTEGER          NOT NULL
+);
+
+-- One row per loan, sharing the loan's primary key. The FK is what the SQLite
+-- schema declared but SQLite does not enforce unless foreign_keys=ON is set per
+-- connection; PostgreSQL enforces it always, so an orphaned borrower row cannot
+-- be loaded at all.
+CREATE TABLE borrowers (
+    loan_id                TEXT             PRIMARY KEY REFERENCES loans(loan_id),
+    annual_inc             DOUBLE PRECISION NOT NULL,
+    emp_length             TEXT,
+    emp_title              TEXT,
+    home_ownership         TEXT             NOT NULL,
+    verification_status    TEXT             NOT NULL,
+    addr_state             TEXT             NOT NULL,
+    dti                    DOUBLE PRECISION,
+    fico_range_low         INTEGER          NOT NULL,
+    fico_range_high        INTEGER          NOT NULL,
+    earliest_cr_line       TEXT             NOT NULL,
+    open_acc               INTEGER          NOT NULL,
+    total_acc              INTEGER          NOT NULL,
+    revol_bal              DOUBLE PRECISION NOT NULL,
+    revol_util             DOUBLE PRECISION,
+    delinq_2yrs            INTEGER          NOT NULL,
+    acc_now_delinq         INTEGER          NOT NULL,
+    inq_last_6mths         INTEGER          NOT NULL,
+    mths_since_last_delinq INTEGER,
+    mths_since_last_record INTEGER,
+    num_tl_90g_dpd_24m     INTEGER          NOT NULL,
+    tot_coll_amt           DOUBLE PRECISION NOT NULL,
+    tot_cur_bal            DOUBLE PRECISION NOT NULL,
+    mo_sin_old_rev_tl_op   INTEGER          NOT NULL,
+    pct_tl_nvr_dlq         DOUBLE PRECISION,
+    pub_rec                INTEGER          NOT NULL,
+    mort_acc               INTEGER          NOT NULL,
+    pub_rec_bankruptcies   INTEGER          NOT NULL
+);
+
+-- SQLite's INTEGER PRIMARY KEY AUTOINCREMENT becomes an identity column.
+-- BY DEFAULT rather than ALWAYS so the five existing limit_id values load as
+-- they are; 02_finalize.sql then advances the sequence past them.
+CREATE TABLE risk_limits (
+    limit_id    INTEGER          GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    metric_name TEXT             NOT NULL,
+    threshold   DOUBLE PRECISION NOT NULL,
+    source      TEXT,
+    description TEXT
+);
+
+COMMIT;

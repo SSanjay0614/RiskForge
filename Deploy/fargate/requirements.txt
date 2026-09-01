@@ -1,0 +1,38 @@
+# Pinned to the exact versions of the local environment the models were trained
+# and the tools were written against, not to "latest compatible".
+#
+# This is not general caution -- it is specific to what the container reuses.
+# tools/feature_engineering_tool.py is copied into the image unchanged and calls
+# pd.get_dummies, np.log1p and pd.to_datetime on the same columns the notebooks
+# did. get_dummies changed its output dtype from uint8 to bool in pandas 2.0,
+# to_datetime changed how it infers mixed formats in 2.0, and either shift would
+# move a feature value without raising anything. A silently shifted feature is a
+# silently wrong Expected Loss, so the versions are pinned rather than resolved.
+pandas==2.3.1
+numpy==2.0.1
+
+# Reads the two frequency maps. Both are plain {str: float} dicts, so nothing
+# here unpickles a fitted estimator -- joblib is the reader for the format the
+# training run happened to write, not a model-loading dependency.
+joblib==1.5.1
+
+# Only tools/regulatory_capital_tool.py needs this, for scipy.stats.norm's ppf
+# and cdf -- the inverse and forward standard normal in the Basel III IRB formula.
+# math.erf and statistics.NormalDist could compute both, and choosing scipy over
+# them is the same decision as everywhere else in this image: the tool is copied
+# in unchanged, so its dependency comes with it rather than the formula being
+# rewritten against a different one.
+scipy==1.13.1
+
+# The dmodels result classes are Pydantic models, and the tools return them.
+pydantic==2.11.7
+
+# config.py calls load_dotenv() at import. There is no .env in the image and
+# there must never be one -- the call is a no-op, and the package is here only
+# so that importing config.py unchanged does not fail.
+python-dotenv==1.0.1
+
+# S3 (read the query CSV, write aggregates) and SageMaker Runtime (PD/LGD).
+# Pinned for the same reason as the rest: an image that builds a different
+# dependency set tomorrow is not the image that was verified today.
+boto3==1.35.36

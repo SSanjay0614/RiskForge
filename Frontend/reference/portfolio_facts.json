@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "Aggregate portfolio facts, recorded from Database/credit_risk.db so the",
+    "Methodology page can state them where that file is absent -- which is the",
+    "case on the EC2 host, whose whole point is that it holds no data and reaches",
+    "no database. Counts, column counts, a date range and the five rows of",
+    "Risk_Limits: every value here is an aggregate or a published threshold, and",
+    "there is no loan or borrower row in it, which is why it is safe in a public",
+    "repository.",
+    "It lives under Frontend/reference/ and not Frontend/data/ because .gitignore",
+    "excludes Data/ at any depth, case-insensitively -- so the obvious folder name",
+    "would have kept this file out of the repository and off the EC2 clone, which",
+    "is exactly the host that needs it.",
+    "Where the database IS present the page reads it live and ignores this file.",
+    "Regenerate with Deploy/streamlit/record_facts.py after any reload."
+  ],
+  "recorded_at": "2026-08-31",
+  "recorded_from": "Database/credit_risk.db",
+  "loans": 878317,
+  "borrowers": 878317,
+  "loan_columns": 12,
+  "borrower_columns": 28,
+  "first_issue": "2013-10-01",
+  "last_issue": "2018-12-01",
+  "limits": [
+    [
+      "lgd_floor_retail_unsecured_other",
+      0.3,
+      "basel_iii"
+    ],
+    [
+      "pd_floor_retail_other",
+      0.0005,
+      "basel_iii"
+    ],
+    [
+      "max_expected_loss_rate",
+      0.05,
+      "internal"
+    ],
+    [
+      "max_hhi_10000_scale",
+      2500.0,
+      "internal"
+    ],
+    [
+      "max_loan_to_deposit_ratio",
+      1.1,
+      "internal"
+    ]
+  ]
+}

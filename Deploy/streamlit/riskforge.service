@@ -1,0 +1,62 @@
+# systemd unit for the Streamlit interface. Installed to
+# /etc/systemd/system/riskforge.service by bootstrap.sh.
+#
+# A unit rather than nohup or tmux, for two reasons that both come up in practice:
+# the app comes back after a reboot without anybody logging in, and a crash is
+# restarted instead of leaving a port that accepts nothing. Its stdout goes to the
+# journal, so `journalctl -u riskforge` is the log -- there is no log file to
+# rotate and nothing writing into the repository checkout.
+
+[Unit]
+Description=RiskForge Streamlit interface
+Documentation=https://github.com/SSanjay0614/RiskForge
+# network-online rather than network: the first thing the app does is resolve an
+# STS endpoint to build the state machine ARN, and a unit started before DNS is up
+# fails with an endpoint error that reads like a permissions problem.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/opt/riskforge/RiskForge
+
+# The switch. Without this the app imports langgraph and calls the local
+# workflow, which on this host would fail at the first import -- so the mode is
+# stated here rather than defaulted, and the default stays local so a developer's
+# machine behaves as it always did.
+Environment=RISKFORGE_BACKEND=stepfunctions
+Environment=AWS_DEFAULT_REGION=us-east-1
+Environment=PYTHONUNBUFFERED=1
+# Streamlit otherwise writes ~/.streamlit and a usage-stats file on first run.
+Environment=STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+# Both of these exist because ProtectHome below makes /home read-only: Streamlit
+# wants a config directory and matplotlib wants a font cache, and both fail with
+# an unhelpful permission error rather than falling back. Pointed at /opt, which
+# ec2-user owns.
+Environment=HOME=/opt/riskforge
+Environment=MPLCONFIGDIR=/opt/riskforge/.matplotlib
+
+# 0.0.0.0 because the browser is not on this host. What restricts access is the
+# security group -- port 8501 from one /32 -- and that is the only access control
+# in front of this app, which is a deliberate demo-scoped decision rather than an
+# oversight. Anything internet-facing needs an identity in front of it.
+ExecStart=/opt/riskforge/venv/bin/streamlit run Frontend/app.py \
+    --server.port=8501 \
+    --server.address=0.0.0.0 \
+    --server.headless=true \
+    --server.fileWatcherType=none
+
+Restart=on-failure
+RestartSec=5
+
+# Cheap hardening. The app writes nothing outside /tmp: it reads the repository,
+# builds a PDF in memory and hands it to the browser.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

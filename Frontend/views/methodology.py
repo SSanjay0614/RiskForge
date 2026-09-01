@@ -9,6 +9,7 @@ Declared as a page by Frontend/app.py, which owns set_page_config and the
 stylesheet.
 """
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -40,8 +41,8 @@ DIAGRAM_WIDTH_PX = 560
 def portfolio_facts() -> dict:
     db_path = PROJECT_ROOT / "Database" / "credit_risk.db"
     if not db_path.exists():
-        return {"available": False}
-    facts = {"available": True}
+        return recorded_facts()
+    facts = {"available": True, "source": "live"}
     # Read-only URI: the page physically cannot write, regardless of the SQL.
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as connection:
         cursor = connection.cursor()
@@ -55,6 +56,28 @@ def portfolio_facts() -> dict:
         facts["limits"] = cursor.execute(
             "SELECT metric_name, threshold, source FROM Risk_Limits ORDER BY source, metric_name"
         ).fetchall()
+    return facts
+
+
+def recorded_facts() -> dict:
+    """The same aggregates, read from a JSON file instead of the database.
+
+    The EC2 host holds no copy of the portfolio and reaches no database -- that
+    is the point of it, and giving this page a connection purely to print four
+    counts would undo it. So the counts, the date range and the five limit rows
+    were recorded once from the SQLite snapshot and are shipped as data. The page
+    says which of the two it read; a stale count presented as live would be the
+    one thing a transparency page must not do.
+    """
+    path = Path(__file__).resolve().parent.parent / "reference" / "portfolio_facts.json"
+    if not path.exists():
+        return {"available": False}
+    with path.open(encoding="utf-8") as handle:
+        recorded = json.load(handle)
+    facts = {key: item for key, item in recorded.items() if not key.startswith("_")}
+    facts["available"] = True
+    facts["source"] = "snapshot"
+    facts["limits"] = [tuple(row) for row in facts.get("limits") or []]
     return facts
 
 
@@ -229,11 +252,20 @@ else:
     data_cards[3].metric(
         "Issue dates", f"{str(facts['first_issue'])[:7]} to {str(facts['last_issue'])[:7]}"
     )
-    st.caption(
-        "Read live from the same SQLite portfolio the agents query, over a read-only "
-        "connection, using aggregates only. Two tables: Loans (contract terms, balances, "
-        "status) joined to Borrowers (credit and income attributes) on `loan_id`."
-    )
+    if facts.get("source") == "snapshot":
+        st.caption(
+            "Recorded from the portfolio database rather than read live: this host "
+            f"holds no copy of it and reaches no database. Figures as of "
+            f"{facts.get('recorded_at', 'the last reload')}. Two tables: Loans "
+            "(contract terms, balances, status) joined to Borrowers (credit and "
+            "income attributes) on `loan_id`."
+        )
+    else:
+        st.caption(
+            "Read live from the same SQLite portfolio the agents query, over a read-only "
+            "connection, using aggregates only. Two tables: Loans (contract terms, balances, "
+            "status) joined to Borrowers (credit and income attributes) on `loan_id`."
+        )
     limits = facts.get("limits") or []
     if limits:
         st.markdown(f"**Risk limits in force ({len(limits)})**")

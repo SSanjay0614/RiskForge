@@ -1,0 +1,31 @@
+# What the interface needs on the EC2 host, which is six packages rather than the
+# root requirements.txt's twenty.
+#
+# The difference is the whole argument for Phase 12: the app on this instance does
+# not answer questions, it asks one. A question goes to the Step Functions state
+# machine, the model calls happen in three Lambdas, the scoring happens in Fargate
+# against two SageMaker endpoints, and the answer comes back as one JSON document
+# of aggregates. So nothing here needs langgraph, langchain, pydantic, xgboost,
+# scikit-learn or joblib -- about 1.5 GB of wheels and roughly thirty seconds of
+# import time that a t3.small does not have to spend.
+#
+# It also means no model artifact, no database driver and no API key on this host.
+# There is nothing on the instance to read: the credentials it holds are an
+# instance role that may start one state machine and describe one execution.
+#
+# Python 3.9, matching the AL2023 default and the version in the root
+# requirements.txt, so the two files cannot disagree about a wheel.
+
+# --- Interface ---
+streamlit==1.50.0
+plotly==6.3.0
+
+# --- PDF risk memo (Frontend/memo.py) ---
+reportlab==4.4.9
+matplotlib==3.9.1
+pillow==11.1.0
+
+# --- AWS SDK: start_execution and describe_execution, nothing else ---
+# Pinned to the version that drove every Phase 11 execution rather than to
+# whatever is current, so the client here is the client that was tested.
+boto3==1.40.59

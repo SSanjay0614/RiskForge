@@ -1,0 +1,582 @@
+{
+  "Comment": "RiskForge: question -> guard -> SQL -> execute -> evaluate -> fan out to two Fargate risk agents -> compliance. Rendered from this file by infra/stepfunctions.tf; every ARN, subnet and bucket name is a Terraform value, so nothing here is copied by hand.",
+  "StartAt": "Init",
+  "TimeoutSeconds": ${execution_timeout},
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Comment": "retry_count and feedback exist from the first state because ASL has no optional path: a reference to a field that is not there fails the execution rather than reading as null.",
+      "Parameters": {
+        "query.$": "$.query",
+        "retry_count": 0,
+        "feedback": "",
+        "last_sql": ""
+      },
+      "Next": "Guard"
+    },
+
+    "Guard": {
+      "Type": "Task",
+      "Comment": "Can this question be answered from the schema at all, and does it need risk analysis.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${guard_arn}",
+        "Payload": {
+          "query.$": "$.query"
+        }
+      },
+      "ResultSelector": {
+        "Payload.$": "$.Payload"
+      },
+      "ResultPath": "$.guard",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "IsAnswerable"
+    },
+
+    "IsAnswerable": {
+      "Type": "Choice",
+      "Comment": "success is checked before is_answerable because a failed model call leaves is_answerable absent, and a Choice rule on a missing path fails the execution.",
+      "Choices": [
+        {
+          "Variable": "$.guard.Payload.success",
+          "BooleanEquals": false,
+          "Next": "GuardFailed"
+        },
+        {
+          "Variable": "$.guard.Payload.is_answerable",
+          "BooleanEquals": true,
+          "Next": "GenerateSQL"
+        }
+      ],
+      "Default": "RejectQuestion"
+    },
+
+    "RejectQuestion": {
+      "Type": "Pass",
+      "Comment": "A refusal is an answer, not a failure: the execution succeeds carrying the guard's reason, so the caller renders it instead of retrying.",
+      "Parameters": {
+        "answered": false,
+        "rejected_by": "guard",
+        "query.$": "$.query",
+        "reason.$": "$.guard.Payload.reason"
+      },
+      "Next": "Rejected"
+    },
+
+    "Rejected": {
+      "Type": "Succeed"
+    },
+    "GenerateSQL": {
+      "Type": "Task",
+      "Comment": "One SELECT for the question. On a retry, feedback carries either the evaluator's reason or the database's own error message.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${sqlgen_arn}",
+        "Payload": {
+          "query.$": "$.query",
+          "feedback.$": "$.feedback"
+        }
+      },
+      "ResultSelector": {
+        "Payload.$": "$.Payload"
+      },
+      "ResultPath": "$.sqlgen",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "DidGenerate"
+    },
+
+    "DidGenerate": {
+      "Type": "Choice",
+      "Comment": "A model call that failed outright is not a rejected statement, so it does not consume a retry: there is nothing to feed back. The second rule is the loop's real terminator: feedback that does not change the statement will not change it on the third attempt either, and running the identical SELECT again costs another database round trip to reach the identical verdict. Tested after success, because sql_query does not exist when the call failed.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.sqlgen.Payload.success", "BooleanEquals": true},
+            {"Variable": "$.sqlgen.Payload.sql_query", "StringEqualsPath": "$.last_sql"}
+          ],
+          "Next": "SqlUnchanged"
+        },
+        {
+          "Variable": "$.sqlgen.Payload.success",
+          "BooleanEquals": true,
+          "Next": "ExecuteSQL"
+        }
+      ],
+      "Default": "SqlGenFailed"
+    },
+
+    "ExecuteSQL": {
+      "Type": "Task",
+      "Comment": "The generated statement, run as riskforge_ro against RDS. max_inline_rows is 1 because this pipeline never wants a row: the rows go to S3 and only the shape comes back.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${execute_sql_arn}",
+        "Payload": {
+          "sql_query.$": "$.sqlgen.Payload.sql_query",
+          "max_inline_rows": 1
+        }
+      },
+      "ResultSelector": {
+        "Payload.$": "$.Payload"
+      },
+      "ResultPath": "$.sql",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "DidQueryRun"
+    },
+
+    "DidQueryRun": {
+      "Type": "Choice",
+      "Comment": "Invalid SQL is a retry with the database's message as feedback, which is the loop the local workflow ran and the reason execute-sql returns errors instead of raising them.",
+      "Choices": [
+        {
+          "Variable": "$.sql.Payload.success",
+          "BooleanEquals": true,
+          "Next": "BuildProfile"
+        }
+      ],
+      "Default": "CanRetryQuery"
+    },
+    "CanRetryQuery": {
+      "Type": "Choice",
+      "Comment": "The timeout is tested before the retry budget, because it is the one query failure that regenerating cannot fix. SQL_GENERATION_PROMPT forbids aggregation and tells the model to return every row when the question implies no filter, so an unfiltered question produces a whole-book join that the 25s statement_timeout in shared/db.py cancels -- and the second and third attempts produce character-identical SQL and cancel identically. Three model calls and three timeouts to reach a conclusion available at the first one.",
+      "Choices": [
+        {
+          "Variable": "$.sql.Payload.error",
+          "StringMatches": "*statement timeout*",
+          "Next": "QueryTooBroad"
+        },
+        {
+          "Variable": "$.retry_count",
+          "NumericLessThan": ${max_retries},
+          "Next": "RetryWithSqlError"
+        }
+      ],
+      "Default": "GaveUp"
+    },
+
+    "RetryWithSqlError": {
+      "Type": "Pass",
+      "Comment": "The state is rebuilt rather than patched, so a stale sql or eval result from the previous attempt cannot survive into the next one.",
+      "Parameters": {
+        "query.$": "$.query",
+        "guard.$": "$.guard",
+        "feedback.$": "$.sql.Payload.error",
+        "last_sql.$": "$.sqlgen.Payload.sql_query",
+        "retry_count.$": "States.MathAdd($.retry_count, 1)"
+      },
+      "Next": "GenerateSQL"
+    },
+
+    "BuildProfile": {
+      "Type": "Pass",
+      "Comment": "The boundary. Rows stop here: the next state's input is built by naming the fields allowed to travel, so an inline row from execute-sql has no path into the evaluator, the model, or anything after it. row_count and columns are the shape; the population itself stays in S3.",
+      "Parameters": {
+        "query.$": "$.query",
+        "guard.$": "$.guard",
+        "retry_count.$": "$.retry_count",
+        "sql_query.$": "$.sqlgen.Payload.sql_query",
+        "source_uri.$": "$.sql.Payload.s3_uri",
+        "row_count.$": "$.sql.Payload.row_count",
+        "truncated.$": "$.sql.Payload.truncated",
+        "profile": {
+          "row_count.$": "$.sql.Payload.row_count",
+          "columns.$": "$.sql.Payload.columns",
+          "filters": []
+        }
+      },
+      "Next": "Evaluate"
+    },
+
+    "Evaluate": {
+      "Type": "Task",
+      "Comment": "Did that statement retrieve the population the question asked about. The evaluator sees the profile and the SQL text, never a row -- and rejects the whole event if one is present.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${evaluator_arn}",
+        "Payload": {
+          "query.$": "$.query",
+          "sql_query.$": "$.sql_query",
+          "profile.$": "$.profile"
+        }
+      },
+      "ResultSelector": {
+        "Payload.$": "$.Payload"
+      },
+      "ResultPath": "$.eval",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "IsValid"
+    },
+
+    "IsValid": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.eval.Payload.success",
+          "BooleanEquals": false,
+          "Next": "EvaluatorFailed"
+        },
+        {
+          "Variable": "$.eval.Payload.is_valid",
+          "BooleanEquals": true,
+          "Next": "NeedsRiskAnalysis"
+        }
+      ],
+      "Default": "CanRetryEval"
+    },
+
+    "CanRetryEval": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.retry_count",
+          "NumericLessThan": ${max_retries},
+          "Next": "RetryWithFeedback"
+        }
+      ],
+      "Default": "GaveUp"
+    },
+
+    "RetryWithFeedback": {
+      "Type": "Pass",
+      "Comment": "The evaluator's rejection reason becomes the generator's feedback -- the same correction loop the local workflow ran, with the counter living in the state JSON instead of a Python variable.",
+      "Parameters": {
+        "query.$": "$.query",
+        "guard.$": "$.guard",
+        "feedback.$": "$.eval.Payload.feedback",
+        "last_sql.$": "$.sql_query",
+        "retry_count.$": "States.MathAdd($.retry_count, 1)"
+      },
+      "Next": "GenerateSQL"
+    },
+    "NeedsRiskAnalysis": {
+      "Type": "Choice",
+      "Comment": "The guard already decided this. A question like 'how many loans are in sub-grade B3' has its answer in the query result, and running two Fargate tasks to restate a row count would cost half a minute and a SageMaker invocation per loan to add nothing.",
+      "Choices": [
+        {
+          "Variable": "$.guard.Payload.requires_risk_analysis",
+          "BooleanEquals": true,
+          "Next": "PlanRun"
+        }
+      ],
+      "Default": "SummariseQuery"
+    },
+
+    "SummariseQuery": {
+      "Type": "Pass",
+      "Parameters": {
+        "answered": true,
+        "risk_analysis": false,
+        "query.$": "$.query",
+        "sql_query.$": "$.sql_query",
+        "source_uri.$": "$.source_uri",
+        "row_count.$": "$.row_count",
+        "truncated.$": "$.truncated",
+        "retries.$": "$.retry_count"
+      },
+      "Next": "QueryOnly"
+    },
+
+    "QueryOnly": {
+      "Type": "Succeed"
+    },
+
+    "PlanRun": {
+      "Type": "Pass",
+      "Comment": "Both output keys are derived from the execution name once, here, so the two branches write under one run prefix and the states that read them address the same objects. Deriving them inside the branches instead would be two chances to disagree.",
+      "Parameters": {
+        "query.$": "$.query",
+        "sql_query.$": "$.sql_query",
+        "source_uri.$": "$.source_uri",
+        "row_count.$": "$.row_count",
+        "retry_count.$": "$.retry_count",
+        "truncated.$": "$.truncated",
+        "credit_key.$": "States.Format('${risk_results_prefix}/{}/credit.json', $$.Execution.Name)",
+        "rates_key.$": "States.Format('${risk_results_prefix}/{}/rates.json', $$.Execution.Name)",
+        "credit_uri.$": "States.Format('s3://${bucket}/${risk_results_prefix}/{}/credit.json', $$.Execution.Name)",
+        "rates_uri.$": "States.Format('s3://${bucket}/${risk_results_prefix}/{}/rates.json', $$.Execution.Name)"
+      },
+      "Next": "FanOut"
+    },
+    "FanOut": {
+      "Type": "Parallel",
+      "Comment": "The two risk agents, started at the same time on separate infrastructure. Both read the query result and neither reads the other's output, so the wall clock is the slower branch rather than the sum -- about 26 seconds for scoring against 0.6 for rates. Same image, same task definition, different --mode.",
+      "ResultPath": "$.branches",
+      "Branches": [
+        {
+          "StartAt": "ScoreLoans",
+          "States": {
+            "ScoreLoans": {
+              "Type": "Task",
+              "Comment": "Feature engineering, PD and LGD from the two endpoints, Expected Loss, Basel III RWA. The Retry below covers capacity and throttling only: a task that started and exited non-zero raises States.TaskFailed and is deliberately not retried, because the input is unchanged and the second run would fail the same way after another 26 seconds of scoring.",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "Cluster": "${cluster_arn}",
+                "TaskDefinition": "${task_definition_arn}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ${subnets_json},
+                    "SecurityGroups": ${security_groups_json},
+                    "AssignPublicIp": "ENABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "${container_name}",
+                      "Command.$": "States.Array('--mode', 'score', '--source-uri', $.source_uri, '--output-uri', $.credit_uri)"
+                    }
+                  ]
+                }
+              },
+              "TimeoutSeconds": ${task_timeout},
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "ECS.AmazonECSException",
+                    "ECS.ServerException",
+                    "ECS.ThrottlingException"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "ResultPath": null,
+              "Next": "ReadCreditResult"
+            },
+            "ReadCreditResult": {
+              "Type": "Task",
+              "Comment": "A Fargate task returns an exit code, not a payload, so the aggregates come back the way they left: from the object the task wrote. GetObject through the SDK integration means no glue Lambda exists to read one JSON file.",
+              "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+              "Parameters": {
+                "Bucket": "${bucket}",
+                "Key.$": "$.credit_key"
+              },
+              "ResultSelector": {
+                "body.$": "$.Body"
+              },
+              "ResultPath": "$.object",
+              "Next": "ParseCreditResult"
+            },
+            "ParseCreditResult": {
+              "Type": "Pass",
+              "Parameters": {
+                "credit.$": "States.StringToJson($.object.body)"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "MeasureRates",
+          "States": {
+            "MeasureRates": {
+              "Type": "Task",
+              "Comment": "Repricing gap and HHI by purpose and by state, on the raw rows -- feature engineering would have encoded away the columns this branch segments on.",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "Cluster": "${cluster_arn}",
+                "TaskDefinition": "${task_definition_arn}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ${subnets_json},
+                    "SecurityGroups": ${security_groups_json},
+                    "AssignPublicIp": "ENABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "${container_name}",
+                      "Command.$": "States.Array('--mode', 'rates', '--source-uri', $.source_uri, '--output-uri', $.rates_uri)"
+                    }
+                  ]
+                }
+              },
+              "TimeoutSeconds": ${task_timeout},
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "ECS.AmazonECSException",
+                    "ECS.ServerException",
+                    "ECS.ThrottlingException"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "ResultPath": null,
+              "Next": "ReadRatesResult"
+            },
+            "ReadRatesResult": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+              "Parameters": {
+                "Bucket": "${bucket}",
+                "Key.$": "$.rates_key"
+              },
+              "ResultSelector": {
+                "body.$": "$.Body"
+              },
+              "ResultPath": "$.object",
+              "Next": "ParseRatesResult"
+            },
+            "ParseRatesResult": {
+              "Type": "Pass",
+              "Parameters": {
+                "rates.$": "States.StringToJson($.object.body)"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "Compliance"
+    },
+    "Compliance": {
+      "Type": "Task",
+      "Comment": "Runs only once both branches have finished, which Step Functions does without being told: the limit check needs the credit metrics and the concentration readings together. Thresholds come from the risk_limits table at invocation time, so the table stays the single source of truth.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${compliance_arn}",
+        "Payload": {
+          "credit_metrics.$": "$.branches[0].credit.result.credit_metrics",
+          "rate_metrics.$": "$.branches[1].rates.result.rate_metrics"
+        }
+      },
+      "ResultSelector": {
+        "Payload.$": "$.Payload"
+      },
+      "ResultPath": "$.compliance",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Summarise"
+    },
+
+    "Summarise": {
+      "Type": "Pass",
+      "Comment": "The execution output is the answer: what was asked, the statement that was run, where the population is, both sets of metrics, and the limit check. Carrying the metrics inline is safe because the task's own output guard refused to write anything that was not an aggregate.",
+      "Parameters": {
+        "answered": true,
+        "risk_analysis": true,
+        "query.$": "$.query",
+        "sql_query.$": "$.sql_query",
+        "retries.$": "$.retry_count",
+        "source_uri.$": "$.source_uri",
+        "row_count.$": "$.row_count",
+        "truncated.$": "$.truncated",
+        "credit_uri.$": "$.credit_uri",
+        "rates_uri.$": "$.rates_uri",
+        "credit_elapsed_ms.$": "$.branches[0].credit.elapsed_ms",
+        "rates_elapsed_ms.$": "$.branches[1].rates.elapsed_ms",
+        "credit_metrics.$": "$.branches[0].credit.result.credit_metrics",
+        "regulatory_capital.$": "$.branches[0].credit.result.regulatory_capital",
+        "rate_metrics.$": "$.branches[1].rates.result.rate_metrics",
+        "compliance.$": "$.compliance.Payload"
+      },
+      "Next": "Done"
+    },
+
+    "Done": {
+      "Type": "Succeed"
+    },
+
+    "GuardFailed": {
+      "Type": "Fail",
+      "Error": "GuardUnavailable",
+      "Cause": "riskforge-guard-action returned success: false. The question was never judged, so nothing downstream ran."
+    },
+
+    "SqlGenFailed": {
+      "Type": "Fail",
+      "Error": "SqlGenerationUnavailable",
+      "Cause": "riskforge-sqlgen-action returned success: false. No statement was produced, so there is nothing to feed back and no retry to make."
+    },
+
+    "EvaluatorFailed": {
+      "Type": "Fail",
+      "Error": "EvaluatorUnavailable",
+      "Cause": "riskforge-evaluator-action returned success: false. The query ran, but nothing judged whether it retrieved the right population -- so the pipeline stops rather than scoring an unverified result."
+    },
+
+    "GaveUp": {
+      "Type": "Fail",
+      "Error": "NoValidQuery",
+      "Cause": "The retry budget was spent without a statement the evaluator accepted. A refusal by the guard is a successful execution; this is not, because the system failed to answer a question it judged answerable."
+    },
+
+    "SqlUnchanged": {
+      "Type": "Fail",
+      "Error": "SqlUnchanged",
+      "Cause": "The generator was given the previous attempt's rejection as feedback and produced a character-identical statement, so the retry loop has nothing left to converge on. The usual cause is a rejection the SQL cannot answer: a correct query over a slice of the book that legitimately holds no matching loans is rejected for returning zero rows, and the only statement that answers the question is the one already written. Read the execution history for the statement and the evaluator's reason."
+    },
+
+    "QueryTooBroad": {
+      "Type": "Fail",
+      "Error": "QueryTooBroad",
+      "Cause": "The statement the question implies did not finish inside the database's 25-second statement_timeout, which happens when a question carries no filter and the generated SELECT is therefore the whole book joined to borrowers. Regenerating cannot help -- the SQL is what the question asked for -- so the retry budget is not spent on it. Ask the question with a filter: a state, a term, a grade, a date range."
+    }
+  }
+}

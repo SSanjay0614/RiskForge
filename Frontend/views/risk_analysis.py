@@ -45,14 +45,7 @@ from theme import (
     value,
 )
 
-from memory.state import RiskGraphState  # noqa: E402
-from workflow.graph import graph  # noqa: E402
-from workflow.nodes import (  # noqa: E402
-    credit_risk_agent,
-    interest_rate_concentration_agent,
-    compliance_agent,
-)
-
+import backend  # noqa: E402
 from memo import build_risk_memo, memo_filename  # noqa: E402
 
 SAMPLE_QUESTIONS = [
@@ -89,7 +82,8 @@ def trace_steps(result_state, elapsed=None):
     # guard ran, not that it blocked. What distinguishes a block is that no SQL
     # was ever generated: data_available also goes false when the retry loop
     # gives up, but by then sql_query is populated.
-    guard_blocked = not data_available and not sql_query
+    guard_blocked = bool(value(result_state, "guard_blocked",
+                                not data_available and not sql_query))
 
     steps = [("Schema guard", "Blocked", "warn") if guard_blocked else ("Schema guard", "Passed", "ok")]
 
@@ -98,7 +92,11 @@ def trace_steps(result_state, elapsed=None):
     else:
         attempts = retries + 1
         label = "1 attempt" if attempts == 1 else f"{attempts} attempts"
-        if not data_available:
+        if value(result_state, "pipeline_error"):
+            # describe_execution returns an error and a cause, never a counter,
+            # and the history that holds one also holds an inline row.
+            label = "no valid result"
+        elif not data_available:
             label = f"{label}, no valid result"
         steps.append(("SQL", label, "ok" if retries == 0 and data_available else "warn"))
 
@@ -503,12 +501,7 @@ def render_memo_download(result_state, button_key):
 
 
 def run_risk_analysis(result_state):
-    state = RiskGraphState.model_validate(result_state)
-    state = state.model_copy(update={"requires_risk_analysis": True}, deep=False)
-    state = state.model_copy(update=credit_risk_agent.run(state), deep=False)
-    state = state.model_copy(update=interest_rate_concentration_agent.run(state), deep=False)
-    state = state.model_copy(update=compliance_agent.run(state), deep=False)
-    return state
+    return backend.run_risk_analysis(result_state)
 
 
 def render_simple(result_state, data_result, button_key):
@@ -522,6 +515,18 @@ def render_simple(result_state, data_result, button_key):
             "<span>Data was retrieved from the loan portfolio.</span></div>",
             unsafe_allow_html=True,
         )
+        if not backend.RISK_ANALYSIS_ON_DEMAND:
+            # The guard classified this as a data question and the pipeline
+            # answered it without scoring. Adding risk analysis now would mean
+            # reading the population back out of S3, which only the Fargate
+            # tasks are permitted to do -- so say that rather than offer a
+            # button that cannot work.
+            st.caption(
+                "The schema guard judged this a data question, so no risk "
+                "analysis was run. Ask it in terms of exposure, loss or "
+                "concentration to get a full report."
+            )
+            return result_state, False
         st.write("Would you like to perform a risk analysis on these rows?")
         if st.button("Run risk analysis", key=button_key, type="primary"):
             with st.spinner("Running credit, interest-rate, concentration, and compliance analysis..."):
@@ -609,7 +614,18 @@ def render_response(result_state, turn_key=None, elapsed=None):
     data_available = bool(value(result_state, "data_available", False))
     retries = int(value(data_result, "retries_used", 0) or 0)
     success = bool(value(data_result, "success", False))
-    if not data_available and not success and retries == 0:
+    pipeline_error = value(result_state, "pipeline_error")
+    if pipeline_error:
+        # An execution that failed is not the same as a question the data cannot
+        # answer, and saying so would misattribute an infrastructure fault to the
+        # loan book. The cause is the state machine's own Cause string, which
+        # says what stopped and what to do about it.
+        st.error(
+            f"The analysis pipeline stopped: **{pipeline_error}**. "
+            f"{value(data_result, 'message', '')}"
+        )
+        render_trace(result_state, elapsed)
+    elif not data_available and not success and retries == 0:
         reason = value(result_state, "guard_reason") or value(
             data_result, "message", "No matching portfolio data was available."
         )
@@ -732,7 +748,7 @@ if query:
     with st.chat_message("assistant"):
         with st.spinner("Running the RiskForge analysis..."):
             started = time.perf_counter()
-            result_state = graph.invoke(RiskGraphState(query=query, max_retries=3))
+            result_state = backend.run_query(query)
             elapsed = time.perf_counter() - started
         render_response(result_state, len(st.session_state.conversation), elapsed)
     st.session_state.conversation.append({"query": query, "result": result_state, "elapsed": elapsed})
