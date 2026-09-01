@@ -146,9 +146,20 @@ def render_trace(result_state, elapsed=None):
 
 
 # --- Charts ---------------------------------------------------------------
+#
+# Every chart takes a `key`, and it is not optional in practice. Streamlit
+# derives an element's identity from its type plus its parameters when no key is
+# given, so two charts built from the same numbers hash to the same id -- and the
+# second one raises StreamlitDuplicateElementId rather than rendering. That is
+# not a hypothetical: the conversation re-renders every past turn on each run, so
+# asking the same question twice puts two identical risk-tier distributions on
+# the page and the app dies on the second. The keys below are all derived from
+# the turn index, which makes them unique across turns and stable across reruns
+# -- stable matters, because a key that changed between runs would reset the
+# chart's own client-side state (zoom, hidden traces) on every interaction.
 
 
-def render_distribution(distribution):
+def render_distribution(distribution, key=None):
     if not distribution:
         st.info("Risk tier distribution is unavailable for these rows.")
         return
@@ -162,10 +173,10 @@ def render_distribution(distribution):
         title="Risk tier distribution", xaxis_title="Portfolio share (%)", yaxis_title=None,
         height=300, margin=dict(l=10, r=10, t=48, b=10),
     )
-    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG)
+    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG, key=key)
 
 
-def render_concentration(title, result):
+def render_concentration(title, result, key=None):
     if not result:
         st.info(f"{title} is unavailable for these rows.")
         return
@@ -184,10 +195,10 @@ def render_concentration(title, result):
         xaxis_title="Exposure share (%)", yaxis_title=None,
         height=max(280, 30 * len(labels) + 90), margin=dict(l=10, r=10, t=65, b=10),
     )
-    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG)
+    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG, key=key)
 
 
-def render_rate_shocks(shocks):
+def render_rate_shocks(shocks, key=None):
     """Earnings at risk: what a parallel move in the curve does to the next
     twelve months of net interest income."""
     labels = [f"{'+' if number(s, 'shock_bps') > 0 else ''}{number(s, 'shock_bps'):.0f}bp" for s in shocks]
@@ -203,10 +214,10 @@ def render_rate_shocks(shocks):
         xaxis_title="Parallel rate shock", yaxis_title="Change in NII",
         height=300, margin=dict(l=10, r=10, t=48, b=10),
     )
-    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG)
+    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG, key=key)
 
 
-def render_gap_chart(labels, gaps, cumulative):
+def render_gap_chart(labels, gaps, cumulative, key=None):
     """Periodic gap as bars, cumulative gap as a line.
 
     The periodic gap says what reprices inside each window; the cumulative line
@@ -229,10 +240,10 @@ def render_gap_chart(labels, gaps, cumulative):
         height=300, margin=dict(l=10, r=10, t=48, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
     )
-    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG)
+    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG, key=key)
 
 
-def render_interest_rate(result):
+def render_interest_rate(result, key=None):
     """Repricing gap plus the earnings view built on top of it.
 
     A gap table on its own is close to unreadable: it reports two large numbers
@@ -314,12 +325,12 @@ def render_interest_rate(result):
     left, right = st.columns(2)
     with left:
         if shocks:
-            render_rate_shocks(shocks)
+            render_rate_shocks(shocks, key="%s-shocks" % key)
         else:
-            render_gap_chart(labels, gaps, cumulative)
+            render_gap_chart(labels, gaps, cumulative, key="%s-gap" % key)
     with right:
         if shocks:
-            render_gap_chart(labels, gaps, cumulative)
+            render_gap_chart(labels, gaps, cumulative, key="%s-gap" % key)
         else:
             st.metric("Net gap", money(net_gap), help=TERM_DEFINITIONS["Repricing gap"])
 
@@ -370,7 +381,7 @@ def render_interest_rate(result):
 
 
 
-def render_flag(flag):
+def render_flag(flag, key=None):
     breached = bool(value(flag, "breached", False))
     css_class = "breach" if breached else "compliant"
     indicator = "⚠ Breached" if breached else "✓ Within limit"
@@ -395,7 +406,7 @@ def render_flag(flag):
     fig.add_vline(x=threshold, line_color=AMBER, line_width=2, annotation_text="threshold", annotation_position="top")
     fig.update_xaxes(range=[0, maximum])
     fig.update_layout(height=130, margin=dict(l=10, r=10, t=25, b=15), showlegend=False)
-    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG)
+    st.plotly_chart(configure_chart(fig), use_container_width=True, config=PLOTLY_CONFIG, key=key)
     citation = value(flag, "citation")
     if citation:
         st.caption(f"Citation: {citation}")
@@ -579,17 +590,20 @@ def render_risk_report(result_state, turn_key=None, elapsed=None):
                 metric(label, display, term)
 
     st.subheader("Credit profile")
-    render_distribution(value(credit, "risk_tier_distribution", {}))
+    render_distribution(value(credit, "risk_tier_distribution", {}),
+                        key="tiers-%s" % turn_key)
 
     st.subheader("Portfolio concentration")
     purpose, region = st.columns(2)
     with purpose:
-        render_concentration("By purpose", value(rate, "concentration_by_purpose"))
+        render_concentration("By purpose", value(rate, "concentration_by_purpose"),
+                             key="purpose-%s" % turn_key)
     with region:
-        render_concentration("By region", value(rate, "concentration_by_region"))
+        render_concentration("By region", value(rate, "concentration_by_region"),
+                             key="region-%s" % turn_key)
 
     st.subheader("Interest-rate sensitivity")
-    render_interest_rate(value(rate, "repricing_gap"))
+    render_interest_rate(value(rate, "repricing_gap"), key="rate-%s" % turn_key)
 
     st.subheader("Compliance")
     render_compliance_banner(compliance)
@@ -597,8 +611,8 @@ def render_risk_report(result_state, turn_key=None, elapsed=None):
     with st.expander(f"Compliance checks ({len(flags)})", expanded=bool(value(compliance, "any_breach", False))):
         if not flags:
             st.info("No compliance checks were returned.")
-        for flag in flags:
-            render_flag(flag)
+        for flag_index, flag in enumerate(flags):
+            render_flag(flag, key="flag-%s-%d" % (turn_key, flag_index))
             st.divider()
     citation = value(compliance, "regulatory_capital_citation")
     if citation:

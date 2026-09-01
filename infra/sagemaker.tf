@@ -51,12 +51,22 @@ resource "aws_sagemaker_model" "lgd" {
   }
 }
 
-# A new endpoint configuration is required for every model change -- the resource
-# is immutable server-side. create_before_destroy lets the endpoint be updated to
-# point at the replacement before the old config goes away, instead of the
-# endpoint briefly referencing nothing.
+# A new endpoint configuration is required for every model or sizing change -- the
+# resource is immutable server-side. create_before_destroy lets the endpoint be
+# updated to point at the replacement before the old config goes away, instead of
+# the endpoint briefly referencing nothing.
+#
+# name_prefix rather than name, and this is what makes the line above true. With
+# a fixed name, create_before_destroy is a promise the provider cannot keep: the
+# replacement is created first *by definition*, so it collides with the config
+# still occupying that name and the apply fails with "Cannot create already
+# existing endpoint configuration". Worse than the error is the near miss --
+# because the name never changed, aws_sagemaker_endpoint showed no diff at all,
+# so a plan that raised max_concurrency looked clean while the running endpoint
+# would have carried on serving the old value. A generated name changes on every
+# sizing change, which is exactly what forces the endpoint to be repointed.
 resource "aws_sagemaker_endpoint_configuration" "pd" {
-  name = "${var.project}-pd-config"
+  name_prefix = "${var.project}-pd-config-"
 
   production_variants {
     variant_name = "AllTraffic"
@@ -74,7 +84,7 @@ resource "aws_sagemaker_endpoint_configuration" "pd" {
 }
 
 resource "aws_sagemaker_endpoint_configuration" "lgd" {
-  name = "${var.project}-lgd-config"
+  name_prefix = "${var.project}-lgd-config-"
 
   production_variants {
     variant_name = "AllTraffic"

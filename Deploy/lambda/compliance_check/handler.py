@@ -118,7 +118,13 @@ REGULATORY_CAPITAL_NOTE = (
 )
 
 def _read_limits():
-    connection = db.connect()
+    # 10 seconds, not the shared default of 25. This function reads a five-row
+    # table, so the budget is not sizing -- it is staying inside this function's
+    # own 30-second Lambda timeout. db.connect() derives the socket timeout from
+    # the statement timeout and keeps it above, so asking for 25 here would put
+    # the socket at 30 and let the function be killed mid-call instead of
+    # returning the error it was built to return.
+    connection = db.connect(statement_timeout_ms=10_000)
     try:
         cursor = connection.cursor()
         cursor.execute(

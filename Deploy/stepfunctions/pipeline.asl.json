@@ -576,7 +576,7 @@
     "QueryTooBroad": {
       "Type": "Fail",
       "Error": "QueryTooBroad",
-      "Cause": "The statement the question implies did not finish inside the database's 25-second statement_timeout, which happens when a question carries no filter and the generated SELECT is therefore the whole book joined to borrowers. Regenerating cannot help -- the SQL is what the question asked for -- so the retry budget is not spent on it. Ask the question with a filter: a state, a term, a grade, a date range."
+      "Cause": "The statement the question implies did not finish inside the database's statement_timeout, which is var.sql_statement_timeout_ms and is measured in minutes rather than seconds -- a whole-portfolio question is a supported question here, not a careless one, and the extract for all 878,317 rows is expected to take that long. Reaching this state now means something other than breadth: a join the schema does not support cheaply, a predicate on an unindexed expression, or a database with no CPU credits left. Regenerating cannot help, because the SQL is what the question asked for, so the retry budget is not spent on it. Read the execution history for the statement, then check the instance's CPUCreditBalance before rewriting the question."
     }
   }
 }

@@ -22,6 +22,40 @@ because the destination is a Lambda behind an LLM rather than a local process:
    extract, and even then `max_inline_rows` is a ceiling a caller can lower and
    cannot raise.
 
+3. **How the rows get out, and why not one at a time.** The obvious shape --
+   `cursor.fetchmany()` in a loop, `csv.writer` on the way past -- was what this
+   handler did first, and it was measurably and structurally wrong for the
+   largest question in the system.
+
+   Measured: 80,000 rows took 24.8 seconds, 17 MB at 0.69 MB/s, which puts the
+   whole 878,317-row book at roughly four minutes. Against that, the *server*
+   scans and joins all 878,317 rows in 6.7 seconds
+   (`SELECT COUNT(*) FROM loans JOIN borrowers USING (loan_id)`). So ~97% of the
+   time was never the database: it was pg8000 -- pure Python, by choice, because
+   psycopg2 is a C extension that cannot be packaged from a Windows machine --
+   decoding 39 fields per row into Python objects, and csv.writer encoding them
+   straight back to text.
+
+   Structural, and the worse half: pg8000 accumulates the entire result set
+   before `fetchmany` returns a single row (`pg8000/core.py:824`,
+   `context.rows.append(row)` in `handle_DATA_ROW`). The streaming sink below is
+   real, but it only ever bounded the *write* side; the read side still
+   materialised 878k rows of Python objects first, which is one to three GB and
+   an out-of-memory kill on the one query the demo exists to answer.
+
+   So the rows are not read at all. `COPY (<query>) TO STDOUT WITH (FORMAT csv)`
+   makes PostgreSQL do the CSV encoding itself, in C, and pg8000 hands the raw
+   bytes to a stream (`pg8000/core.py:460`) without ever building a row. Peak
+   memory becomes one 8 MB part, for real this time, and the per-field Python
+   work disappears rather than getting a bigger CPU thrown at it.
+
+   `COPY ... TO STDOUT` needs no privilege beyond the SELECT `riskforge_ro`
+   already holds -- it is `COPY ... TO '/path'` that requires superuser or
+   `pg_write_server_files`, and that distinction is exactly why this is safe to
+   use here. It is also why COPY stays in BLOCKED_KEYWORDS: the caller may never
+   send one, and this handler builds its own around SQL that has already passed
+   the whole of `_validate`.
+
 Event:
     {"sql_query": "SELECT ...", "max_rows": 200000, "max_inline_rows": 100}
 
@@ -58,8 +92,13 @@ RESULTS_PREFIX = os.environ.get("RESULTS_PREFIX", "query-results")
 # than a refused query.
 DEFAULT_MAX_ROWS = 1_000_000
 DEFAULT_MAX_INLINE_ROWS = 100
-FETCH_CHUNK = 10_000
 PART_SIZE = 8 * 1024 * 1024  # S3 multipart minimum is 5 MiB per part except the last
+
+# Enough of the front of the CSV to recover a small result inline without asking
+# the database a second time. 512 KB holds far more than DEFAULT_MAX_INLINE_ROWS
+# rows of a 39-column extract, and it is kept whatever the result size so the
+# decision to return rows or withhold them stays a pure function of row_count.
+HEAD_TEE_BYTES = 512 * 1024
 
 # PostgreSQL's write and privilege verbs, plus the ones that reach outside the
 # database: COPY can read and write server-side files, DO runs a procedural
@@ -99,38 +138,48 @@ def _validate(sql_query):
 
     return None
 
-class _S3CsvSink:
+class _S3ByteSink:
     """
-    Streams CSV to S3 in fixed-size parts, so peak memory is one part rather
-    than one result set. A 878k-row extract is a few hundred MB of CSV; buffering
-    that whole thing to hand to put_object is how a 512 MB Lambda dies on the
-    query that matters most.
+    Forwards the bytes PostgreSQL emits straight into an S3 multipart upload, in
+    fixed-size parts, and keeps the first HEAD_TEE_BYTES of them so a small
+    result can still be returned inline without a second query.
+
+    A byte sink rather than the csv.writer one it replaces, because nothing on
+    this path builds a Python row any more -- see point 3 of the module
+    docstring. `write` receives raw bytes, which is what pg8000 hands a stream
+    that is not a TextIOBase (pg8000/core.py:460), so this class must not inherit
+    from one.
     """
 
     def __init__(self, bucket, key):
         self.bucket = bucket
         self.key = key
-        self._reset_buffer()
+        self.buffer = bytearray()
+        self.head = bytearray()
+        self.head_truncated = False
         self.parts = []
         self.total_bytes = 0
         self.upload_id = _s3.create_multipart_upload(
             Bucket=bucket, Key=key, ContentType="text/csv", ServerSideEncryption="AES256"
         )["UploadId"]
 
-    def _reset_buffer(self):
-        self.buffer = io.StringIO()
-        self.writer = csv.writer(self.buffer, lineterminator="\n")
-
-    def write_rows(self, rows):
-        self.writer.writerows(rows)
-        if self.buffer.tell() >= PART_SIZE:
+    def write(self, data):
+        self.buffer += data
+        room = HEAD_TEE_BYTES - len(self.head)
+        if room > 0:
+            self.head += data[:room]
+        elif not self.head_truncated:
+            # Recorded rather than inferred, because the last line in a full head
+            # is almost certainly cut mid-row and must not be parsed.
+            self.head_truncated = True
+        if len(self.buffer) >= PART_SIZE:
             self._flush()
 
     def _flush(self):
-        payload = self.buffer.getvalue().encode("utf-8")
-        if not payload:
+        if not self.buffer:
             return
         part_number = len(self.parts) + 1
+        payload = bytes(self.buffer)
         etag = _s3.upload_part(
             Bucket=self.bucket,
             Key=self.key,
@@ -140,7 +189,7 @@ class _S3CsvSink:
         )["ETag"]
         self.parts.append({"PartNumber": part_number, "ETag": etag})
         self.total_bytes += len(payload)
-        self._reset_buffer()
+        self.buffer = bytearray()
 
     def close(self):
         self._flush()
@@ -161,6 +210,56 @@ class _S3CsvSink:
             )
         except Exception:  # nothing useful to do about a failed cleanup
             pass
+
+def _copy_statement(sql_query, max_rows):
+    """
+    Wraps a validated SELECT in a COPY that PostgreSQL encodes to CSV itself.
+
+    The interpolation here is deliberate and is safe for one reason only: by the
+    time this is called, `sql_query` has passed every check in `_validate` -- it
+    begins with SELECT, contains no semicolon outside a string literal, and
+    contains none of BLOCKED_KEYWORDS. A caller cannot append a second statement
+    and cannot smuggle a COPY of its own. Nothing here may be reached on an
+    unvalidated string.
+
+    The `LIMIT` is the row ceiling, applied by the server so the rows above it
+    are never encoded rather than encoded and then thrown away. It nests: an
+    inner query that already carries its own LIMIT stays correct.
+    """
+    return (
+        "COPY (SELECT * FROM (%s) AS q LIMIT %d) TO STDOUT "
+        "WITH (FORMAT csv, HEADER true)" % (sql_query, int(max_rows))
+    )
+
+
+def _describe(cursor, sql_query):
+    """
+    Column names and type names, without fetching a row.
+
+    COPY returns bytes and a count, not a cursor description, so the shape of the
+    result has to be asked for separately. `LIMIT 0` plans the query and returns
+    the RowDescription without executing it, which costs nothing measurable.
+    """
+    cursor.execute("SELECT * FROM (%s) AS q LIMIT 0" % sql_query)
+    cursor.fetchall()
+    # Read both off the description before anything else runs on this cursor:
+    # the next execute() replaces it.
+    columns = [d[0] for d in cursor.description]
+    type_oids = [d[1] for d in cursor.description]
+    return columns, _type_names(cursor, type_oids)
+
+
+def _head_rows(sink, want):
+    """The first `want` data rows, parsed back out of the tee'd head of the CSV.
+
+    csv.reader rather than a split on newlines, because a quoted field may
+    legally contain one and splitting would produce rows that were never in the
+    result."""
+    rows = list(csv.reader(io.StringIO(bytes(sink.head).decode("utf-8", "replace"))))
+    if sink.head_truncated and rows:
+        rows = rows[:-1]  # last line was cut mid-row
+    return [list(r) for r in rows[1 : want + 1]]  # rows[0] is the CSV header
+
 
 def lambda_handler(event, context):
     sql_query = (event or {}).get("sql_query") or (event or {}).get("sql")
@@ -185,34 +284,16 @@ def lambda_handler(event, context):
     try:
         connection = db.connect()
         cursor = connection.cursor()
-        cursor.execute(sql_query)
 
-        columns = [d[0] for d in cursor.description]
-        # pg8000 reports the PostgreSQL type OID; the name is what a caller can
-        # act on, and pg_type is readable without extra privileges.
-        type_oids = [d[1] for d in cursor.description]
+        columns, column_types = _describe(cursor, sql_query)
 
-        sink = _S3CsvSink(ARTIFACTS_BUCKET, key)
-        sink.write_rows([columns])
+        sink = _S3ByteSink(ARTIFACTS_BUCKET, key)
+        cursor.execute(_copy_statement(sql_query, max_rows), stream=sink)
+        # PostgreSQL's `COPY <n>` completion tag, which pg8000 parses into
+        # rowcount (pg8000/core.py:796). Counts data rows, not the header.
+        row_count = cursor.rowcount
 
-        row_count = 0
-        truncated = False
-        inline_rows = []
-        while True:
-            chunk = cursor.fetchmany(FETCH_CHUNK)
-            if not chunk:
-                break
-            if row_count + len(chunk) > max_rows:
-                chunk = chunk[: max_rows - row_count]
-                truncated = True
-            sink.write_rows(chunk)
-            if len(inline_rows) < max_inline_rows:
-                inline_rows.extend(chunk[: max_inline_rows - len(inline_rows)])
-            row_count += len(chunk)
-            if truncated:
-                break
-
-        column_types = _type_names(cursor, type_oids)
+        inline_rows = _head_rows(sink, max_inline_rows) if row_count <= max_inline_rows else None
         cursor.close()
         total_bytes = sink.close()
         sink = None
@@ -230,9 +311,13 @@ def lambda_handler(event, context):
             except Exception:
                 pass
 
+    # `>=` rather than `>`: the ceiling is applied as a server-side LIMIT, so a
+    # result that lands exactly on it cannot be told apart from one cut short by
+    # it. Over-reporting truncation is the safe direction of that ambiguity.
+    truncated = row_count >= max_rows
+
     withheld = None
     if row_count > max_inline_rows:
-        inline_rows = None
         withheld = (
             "%d rows is above the %d-row inline ceiling, so the rows were not returned. "
             "Read them from %s in S3, or aggregate in SQL." % (row_count, max_inline_rows, key)
@@ -248,7 +333,7 @@ def lambda_handler(event, context):
         "bytes": total_bytes,
         "truncated": truncated,
         "elapsed_ms": int((time.time() - started) * 1000),
-        "rows": [list(r) for r in inline_rows] if inline_rows else None,
+        "rows": inline_rows or None,
         "rows_withheld_reason": withheld,
     }
 

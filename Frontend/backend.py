@@ -40,10 +40,17 @@ REGION = os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 MAX_RETRIES = 3
 
 # Seconds to poll before giving up on the answer. The execution's own timeout is
-# var.pipeline_execution_timeout (1800); this is shorter because somebody is
+# var.pipeline_execution_timeout (3600); this stays shorter because somebody is
 # watching a spinner. Giving up here does not cancel the execution -- it is
 # still in the history, and still finishes.
-POLL_TIMEOUT = int(os.environ.get("RISKFORGE_POLL_TIMEOUT") or 600)
+#
+# 1800, raised from 600. A whole-portfolio question -- 878,317 rows extracted,
+# feature-engineered and scored in 439 batches -- runs for minutes, and at 600
+# the interface abandoned the one question the system is built to answer while
+# the pipeline was still working on it correctly. That is the worst possible
+# shape for this bug: nothing fails, nothing alarms, and the analyst is told the
+# run timed out.
+POLL_TIMEOUT = int(os.environ.get("RISKFORGE_POLL_TIMEOUT") or 1800)
 POLL_INTERVAL = 2.0
 
 # Local mode offers the "run risk analysis on these rows" button because the

@@ -29,21 +29,27 @@ resource "aws_lambda_function" "execute_sql" {
   filename         = "${local.lambda_dist}/execute_sql.zip"
   source_code_hash = filebase64sha256("${local.lambda_dist}/execute_sql.zip")
 
-  # Long enough for a full scan of the 878k-row join plus the S3 upload, and
-  # short of the 25s statement_timeout the database enforces plus headroom, so a
-  # slow query dies as a clear PostgreSQL timeout rather than as an opaque
-  # Lambda one.
-  timeout = 60
+  # 900 seconds, the Lambda hard maximum, raised from 60. It is the outermost of
+  # the four nested timeouts on this path -- see sql_statement_timeout_ms, which
+  # documents the whole chain -- and it is set to the wall rather than to a
+  # measured figure on purpose: everything inside it is bounded by a limit this
+  # function controls, so the only thing this ceiling can now catch is the
+  # platform failing in a way the others cannot see.
+  timeout = 900
 
-  # 512 MB against a streaming writer that holds one 8 MB part at a time. Memory
-  # also buys proportional CPU here, and CSV formatting of a large result set is
-  # CPU-bound.
-  memory_size = 512
+  # 3008 MB, raised from 512. Memory buys proportional vCPU and network bandwidth
+  # on Lambda, and both matter here: the function reads a CSV stream from
+  # PostgreSQL and writes it to S3 in 8 MB parts, so a whole-portfolio extract is
+  # ~187 MB moving through it. It is not held -- COPY TO STDOUT means no row ever
+  # becomes a Python object (see the handler's docstring), which is what makes
+  # this size about throughput rather than about capacity.
+  memory_size = 3008
 
   environment {
     variables = merge(local.lambda_db_env, {
-      ARTIFACTS_BUCKET = aws_s3_bucket.artifacts.id
-      RESULTS_PREFIX   = var.query_results_prefix
+      ARTIFACTS_BUCKET     = aws_s3_bucket.artifacts.id
+      RESULTS_PREFIX       = var.query_results_prefix
+      STATEMENT_TIMEOUT_MS = tostring(var.sql_statement_timeout_ms)
     })
   }
 

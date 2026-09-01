@@ -63,9 +63,18 @@ MAX_PAYLOAD_BYTES = 3 * 1024 * 1024
 # comfortably inside the limit with room for wider float representations.
 DEFAULT_BATCH_ROWS = 2000
 
-# The endpoints are configured with max_concurrency 5 (see infra/sagemaker.tf).
-# Matching it exactly is the whole tuning story: fewer leaves capacity idle, more
-# only fills a queue on the endpoint's side.
+# Matched to the endpoints' max_concurrency, which Terraform passes in as WORKERS
+# on the task definition -- so this literal is only the fallback for a container
+# run by hand. Matching it is the whole tuning story: fewer leaves paid capacity
+# idle, more only fills a queue on the endpoint's side.
+#
+# 5, and it is the account quota rather than a measurement. Service Quotas
+# L-96300102, total concurrency across all serverless endpoints, is 10 on this
+# account and PD and LGD are two endpoints. It was briefly set to 50 here, which
+# is the right number for the workload -- 878,317 rows is hundreds of batches and
+# at 5 concurrent most of the run is round-trip latency with the endpoint idle
+# between -- and the apply that tried it was refused by SageMaker. Raise the quota
+# first; infra/variables.tf carries the note.
 DEFAULT_WORKERS = 5
 
 # ModelNotReadyException is the cold start of a Serverless endpoint that has
@@ -86,7 +95,7 @@ def _runtime():
     """
     One client per thread. botocore clients are documented as thread-safe for
     calls, but the retry and connection-pool state is not worth sharing across
-    five threads to save four object constructions.
+    the pool to save a handful of object constructions.
     """
     client = getattr(_local, "client", None)
     if client is None:
@@ -102,7 +111,12 @@ def _runtime():
                 # 60s read timeout would abandon it just as the container came up.
                 read_timeout=180,
                 connect_timeout=15,
-                max_pool_connections=DEFAULT_WORKERS + 2,
+                # 4, not the worker count. This client belongs to one thread and
+                # that thread has one request outstanding at a time, so the pool
+                # only ever needs one connection -- the old `DEFAULT_WORKERS + 2`
+                # scaled the wrong thing, and at 50 workers it would have
+                # allocated 52 idle connections per thread.
+                max_pool_connections=4,
             ),
         )
         _local.client = client

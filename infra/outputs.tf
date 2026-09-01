@@ -119,3 +119,16 @@ output "risk_task_network" {
     assign_public_ip = true
   }
 }
+
+output "dashboard_url" {
+  description = "Deep link to the Phase 13 dashboard."
+  value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards/dashboard/${aws_cloudwatch_dashboard.overview.dashboard_name}"
+}
+
+output "alerts_topic_arn" {
+  description = <<-EOT
+    Topic the five alarms publish to. Check the subscription actually confirmed:
+    aws sns list-subscriptions-by-topic --profile riskforge --topic-arn <this>
+  EOT
+  value       = aws_sns_topic.alerts.arn
+}

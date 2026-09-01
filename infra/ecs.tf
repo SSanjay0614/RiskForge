@@ -95,6 +95,20 @@ resource "aws_ecs_task_definition" "risk" {
         # task run, with no image rebuild.
         { name = "PD_ENDPOINT", value = aws_sagemaker_endpoint.pd.name },
         { name = "LGD_ENDPOINT", value = aws_sagemaker_endpoint.lgd.name },
+        # The scoring thread count, set from the same variable that sets the
+        # endpoints' max_concurrency so the two cannot drift. They are one
+        # decision, not two: workers below the endpoint's concurrency leaves paid
+        # capacity idle, and workers above it only fills a queue on SageMaker's
+        # side. Both are currently 5 because the account's total serverless
+        # concurrency quota is 10 across two endpoints -- see the variable. When
+        # that quota is raised, this follows on the next apply with no image
+        # rebuild, which is why it is an environment variable and not a default
+        # in scoring.py.
+        { name = "WORKERS", value = tostring(var.sagemaker_max_concurrency) },
+        # Rows per inference request. With concurrency fixed by quota, batch size
+        # is the only remaining lever on how many sequential round trips the whole
+        # book costs, so it is worth being settable without a rebuild too.
+        { name = "BATCH_ROWS", value = tostring(var.sagemaker_batch_rows) },
         # boto3 finds the region from this. ECS provides credentials through the
         # task role's metadata endpoint but does not set a region, and a client
         # built without one fails with NoRegionError -- which looks like a

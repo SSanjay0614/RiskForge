@@ -99,22 +99,100 @@ variable "sagemaker_xgboost_version" {
 variable "sagemaker_memory_mb" {
   description = <<-EOT
     Serverless endpoint memory, which also determines the vCPU allocated. Valid
-    values are 1024-6144 in 1024 steps. 2048 is comfortable for a 1000-tree
-    XGBoost booster; raise it if the container logs an out-of-memory error, or to
-    shorten cold starts, at a proportionally higher per-second price.
+    values are 1024-6144 in 1024 steps.
+
+    3072, and this is the account's ceiling rather than a choice. The reason to
+    raise it at all is cold start, not capacity: a 1000-tree XGBoost booster is
+    comfortable in 2048, which is what this was, but ModelLatency runs 78-177 ms
+    against a ModelSetupTime of 8.3-8.9 s and an OverheadLatency of 5.4-6.6 s.
+    The model is two orders of magnitude faster than the act of waking it up, and
+    memory is the only lever this endpoint type gives on that.
+
+    6144 was applied for and refused: `ResourceLimitExceeded: The account-level
+    service limit 'Memory size in MB per serverless endpoint' is 3072 MBs`. That
+    limit is not listed in Service Quotas at all -- the error's own fallback
+    advice is to open a support case -- so 3072 is the highest value this account
+    can apply until one is granted. Serverless bills per GB-second of invocation
+    duration, so the higher tier is not free; it is a trade of per-second price
+    against the setup time that dominates a whole-portfolio run.
   EOT
   type        = number
-  default     = 2048
+  default     = 3072
 }
 
 variable "sagemaker_max_concurrency" {
   description = <<-EOT
-    Concurrent invocations per endpoint before SageMaker throttles. One analyst
-    and one Fargate scoring task do not need much; 5 leaves headroom for the
-    Step Functions fan-out to score several segments at once without queueing.
+    Concurrent invocations per endpoint before SageMaker throttles. Multiplied by
+    the number of endpoints, this is spent against one account-wide budget.
+
+    5, and unlike every other number in this file it is not sized to the
+    workload -- it is the whole quota, divided by two. Service Quotas
+    L-96300102, "Maximum total concurrency that can be allocated across all
+    serverless endpoints", is 10 on this account, and PD and LGD are two
+    endpoints, so 5 each is the arithmetic. An apply at 50 fails at the
+    UpdateEndpoint call, not at plan time.
+
+    What that costs is worth stating plainly, because it is the binding
+    constraint on the headline question: the whole 878,317-row book splits into
+    batches, and at 5 concurrent the task makes many more sequential round trips
+    than the endpoint's own speed would require. AWS's published default for this
+    quota is 200 -- 10 is a new-account throttle -- so an increase request is the
+    real fix. Once it is granted, raise this to 50 and re-apply; nothing else has
+    to change, because sagemaker_batch_rows and the task's --workers both follow
+    from it.
   EOT
   type        = number
   default     = 5
+}
+
+variable "sagemaker_batch_rows" {
+  description = <<-EOT
+    Rows per inference request, passed to the task as BATCH_ROWS.
+
+    3,000, raised from the 2,000 compiled into scoring.py, and this is the one
+    lever on round-trip count that does not need a quota increase. With
+    concurrency pinned at 5 by L-96300102, the only way to cut sequential rounds
+    is to put more rows in each request: 878,317 rows is 440 batches at 2,000 and
+    293 at 3,000, so a third of the round trips disappear for free.
+
+    Not higher, because a Serverless endpoint's request body limit is 4 MB and
+    scoring.py budgets 3 MB of it. At roughly 800 bytes of JSON per row that puts
+    the ceiling near 3,750, and a batch that does come out oversized is split in
+    half and re-sent rather than rejected -- so overshooting costs a wasted round
+    trip, which is exactly what this is trying to save.
+  EOT
+  type        = number
+  default     = 3000
+}
+
+variable "sql_statement_timeout_ms" {
+  description = <<-EOT
+    The statement budget the execute-sql function sets on its own session, in
+    milliseconds, and the ceiling a question has to answer within.
+
+    600,000, raised from a literal 25,000 in Deploy/lambda/shared/db.py. 25
+    seconds was measured against a filtered question and was right for one; it
+    was wrong for the question this system is built to answer. The whole-portfolio
+    join scans 878,317 rows in 6.7 seconds server-side and the extract that
+    follows takes minutes, so a 25-second ceiling did not refuse a careless query,
+    it refused the headline one -- and refused it as `57014 statement timeout`,
+    which the state machine maps to QueryTooBroad. The largest legitimate question
+    in the portfolio reported itself as too vague to answer.
+
+    Four timeouts have to nest in this order, each strictly containing the one
+    inside it, or a legal query dies as the wrong kind of error:
+
+      statement_timeout       600s  this variable, enforced by PostgreSQL
+      pg8000 socket read      605s  derived in db.py as this + 5
+      execute-sql Lambda      900s  the Lambda hard maximum
+      Step Functions task    1800s  pipeline_task_timeout
+
+    900 is a wall, not a choice -- no Lambda may run longer -- so 600 here is what
+    leaves the server room to end its own query and say so before the platform
+    kills the function underneath it.
+  EOT
+  type        = number
+  default     = 600000
 }
 
 variable "db_readonly_user" {
@@ -275,28 +353,43 @@ variable "risk_image_tag" {
 
 variable "risk_task_cpu" {
   description = <<-EOT
-    Fargate task vCPU, in units of 1024. 2048 (2 vCPU) because the container
-    holds the whole query result as a DataFrame and runs five concurrent HTTPS
-    calls to the SageMaker endpoints while pandas engineers the next batch.
+    Fargate task vCPU, in units of 1024. 4096 (4 vCPU), raised from 2048.
+
+    Two of those four are for the scoring thread pool, which is network-bound
+    against the endpoints and releases the GIL, so it scales with cores once
+    --workers is raised past 5. The other two are the honest limit of this: pandas
+    feature engineering across 878k rows is single-threaded, and no core count
+    fixes that. 8 vCPU was considered and rejected for exactly that reason -- it
+    would double the per-second price to leave four cores idle.
 
     Fargate bills per second for exactly this, so the size is a wall-clock
     decision, not a monthly one: doubling the CPU on a 40-second task costs
     another 40 seconds of the larger size.
   EOT
   type        = number
-  default     = 2048
+  default     = 4096
 }
 
 variable "risk_task_memory" {
   description = <<-EOT
-    Fargate task memory in MiB. Valid pairings with 2048 CPU are 4096-16384 in
-    1024 steps. 8192 because the working set is the raw frame plus the engineered
-    frame plus the batch matrices, and the raw frame for the whole 878k-row book
-    is around 1.5 GB before any of that -- Deploy/fargate/riskforge/inputs.py caps
-    the row count at 1.2 million for the same reason.
+    Fargate task memory in MiB. Valid pairings with 4096 CPU are 8192-30720 in
+    1024 steps.
+
+    30720, the ceiling, raised from 8192 -- and this one is bought as insurance
+    rather than for throughput. The working set on a whole-portfolio run is the
+    raw 878k-row frame (~1.5 GB), plus the engineered frame after one-hot
+    expansion, plus the batch matrices in flight, and pandas transiently holds
+    two copies of a frame during several of those operations. 8192 was sized
+    against a filtered question and would very likely have met the headline one
+    with an OOM kill -- which Fargate reports as a bare non-zero exit that the
+    state machine does not retry, so it would have surfaced in a demo as the
+    pipeline simply failing.
+
+    Memory alone is close to free next to the vCPU it is paired with, so there is
+    no argument for cutting this fine.
   EOT
   type        = number
-  default     = 8192
+  default     = 30720
 }
 
 variable "risk_results_prefix" {
@@ -335,29 +428,104 @@ variable "pipeline_max_retries" {
 variable "pipeline_task_timeout" {
   description = <<-EOT
     Seconds a single Fargate branch may take before Step Functions abandons it.
-    900 against a scoring branch that takes about 26 seconds: the margin is not
-    for slow scoring but for a task stuck in PROVISIONING, which is the failure
-    this timeout exists to end. Long enough that a genuinely large population is
-    never cut off mid-run, short enough that a wedged task does not hold an
-    execution open for the full 1800.
+
+    1800, raised from 900. The old value carried a margin of thirty-odd times the
+    observed scoring time, which sounded generous and was measured against a
+    16,000-row question. A whole-portfolio branch is 878,317 rows: minutes of
+    feature engineering and 439 scoring batches, on top of the cold start the
+    margin was actually there for. 900 would have cut the headline run off
+    mid-scoring and reported it as a task timeout.
+
+    Still bounded, and that is the point -- this timeout exists to end a task
+    wedged in PROVISIONING, not to accommodate one. Long enough that the largest
+    legitimate population is never cut off, short enough that a stuck task does
+    not hold an execution open for the full 3600.
   EOT
   type        = number
-  default     = 900
+  default     = 1800
 }
 
 variable "pipeline_execution_timeout" {
   description = <<-EOT
     Seconds an execution may run in total. A Standard workflow's default is a
     year, which is the wrong default for a question somebody is waiting on: an
-    execution that hangs should end and say so. 1800 is roughly twenty times the
-    observed end-to-end time.
+    execution that hangs should end and say so.
+
+    3600, raised from 1800, to stay clear of the two 1800-second branch timeouts
+    beneath it. The old pair was 1800 and 900 -- an execution ceiling exactly
+    twice a branch ceiling, which is fine until two branches run in sequence
+    around the fan-out. Keeping this at twice pipeline_task_timeout preserves the
+    property that a branch timeout always fires first and names the branch, rather
+    than the execution timing out and naming nothing.
   EOT
   type        = number
-  default     = 1800
+  default     = 3600
 }
 
 variable "pipeline_log_retention_days" {
   description = "CloudWatch Logs retention for the state machine's transition log. Shorter than the 90-day execution history on purpose: the history is the audit trail, this group is for watching a run go past."
   type        = number
   default     = 14
+}
+
+variable "alert_email" {
+  description = <<-EOT
+    Address the alarm topic mails. Empty by default, which creates the topic and
+    the alarms but no subscription, so the build still applies for anyone who does
+    not want mail. Set it in terraform.tfvars, which is gitignored -- the repo is
+    public and this is a personal address.
+
+    An email subscription is created in PendingConfirmation and delivers nothing
+    until the link in the confirmation mail is clicked. Terraform reports the
+    resource as created either way and cannot see the difference, so confirm it
+    once by hand:
+      aws sns list-subscriptions-by-topic --topic-arn <topic arn>
+    SubscriptionArn reads PendingConfirmation before the click and a real ARN after.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "pipeline_slow_threshold_ms" {
+  description = <<-EOT
+    Execution time above which an otherwise successful run raises an alarm.
+
+    600,000 ms against an observed 115-131 seconds end to end, so roughly five
+    times the normal figure. The gap is deliberate and it is mostly Fargate: two
+    branches start cold, and a task sitting in PROVISIONING for a few minutes is
+    slow rather than broken. Tightening this toward the observed time would alarm
+    on a cold start, which is the normal case here, not a fault.
+
+    The point of this alarm is the failure the other two cannot see -- a run that
+    succeeds but takes ten minutes is still ExecutionsSucceeded = 1 and never
+    reaches pipeline_execution_timeout, so without this it is invisible until an
+    analyst complains.
+  EOT
+  type        = number
+  default     = 600000
+}
+
+variable "rds_low_memory_threshold_bytes" {
+  description = <<-EOT
+    FreeableMemory floor, in bytes. 41,943,040 -- 40 MiB.
+
+    Measured rather than chosen. Six hours of the live db.t4g.micro reported
+    FreeableMemory between 86.8 and 146.8 MiB, averaging 101.7, so this instance
+    genuinely runs with well under a tenth of its 1 GiB free and that is its
+    normal state, not a warning. A threshold at 100 MiB -- which is what the
+    round-number instinct suggests -- would have alarmed continuously from the
+    moment it was applied.
+
+    40 MiB sits below the observed floor with room to spare, so it fires on
+    something that has never happened rather than on Tuesday. Paired with three
+    evaluation periods, because a single dip during a large scan is the instance
+    working.
+
+    Worth watching for a second reason: 1 GiB of RAM against a working set of
+    roughly 412 MB is a small page cache, which is exactly why a table scan
+    straight after a restart is slow -- the condition that made the pg8000 socket
+    timeout in Phase 12 look intermittent.
+  EOT
+  type        = number
+  default     = 41943040
 }
