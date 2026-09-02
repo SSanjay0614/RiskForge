@@ -48,6 +48,47 @@ resource "aws_db_parameter_group" "postgres" {
     apply_method = "immediate"
   }
 
+  # These two are kept for the cold case and are honestly a null result on the warm
+  # one, which is worth writing down rather than leaving as an implied win.
+  #
+  # The reasoning that produced them: work_mem is unset in the postgres16 family,
+  # which means the engine default of 4 MB, and the join the pipeline runs --
+  # loans x borrowers on loan_id, 878,317 rows each side -- cannot build a hash
+  # table in 4 MB by two orders of magnitude, so the planner batches it and writes
+  # every batch to disk. A first query of a session, against a cold buffer cache,
+  # was measured at 46.2 seconds with 340 read IOPS behind it, which is what that
+  # spilling looks like.
+  #
+  # What the measurement then said: on the warm full-portfolio extract these
+  # changed nothing at all. The ExecuteSQL Lambda reported 22731.72 ms before and
+  # 22732.57 ms after -- under a millisecond apart -- with the instance at 38 read
+  # IOPS, 3 MB/s and 14% CPU. Nothing was spilling by then, because both tables
+  # were already in the buffer cache, so there was nothing here to fix. The
+  # remaining time is single-threaded Python decoding a 177 MB COPY stream at about
+  # 7.8 MB/s, which is a client-side limit and not a server-side one.
+  #
+  # They stay because the cold path is the demo's first question and is the case
+  # they address, and because 4 MB is the wrong default for this join whether or not
+  # a warm cache hides it. 32 MB rather than more is the careful part: work_mem is
+  # per sort or hash *operation*, so the worst case is this value times the number
+  # of concurrent operations, against an instance with 1 GiB total, roughly 256 MB
+  # already in shared_buffers and about 105 MB freeable under load. A generous
+  # work_mem on a 1 GiB instance does not make the join fast, it makes the instance
+  # run out of memory. hash_mem_multiplier then gives the hash join 64 MB while
+  # leaving sorts at 32, which targets the one operation that matters instead of
+  # raising the budget for everything that might run beside it.
+  parameter {
+    name         = "work_mem"
+    value        = "32768"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "hash_mem_multiplier"
+    value        = "2.0"
+    apply_method = "immediate"
+  }
+
   lifecycle {
     create_before_destroy = true
   }

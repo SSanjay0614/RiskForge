@@ -37,13 +37,27 @@ resource "aws_lambda_function" "execute_sql" {
   # platform failing in a way the others cannot see.
   timeout = 900
 
-  # 3008 MB, raised from 512. Memory buys proportional vCPU and network bandwidth
-  # on Lambda, and both matter here: the function reads a CSV stream from
-  # PostgreSQL and writes it to S3 in 8 MB parts, so a whole-portfolio extract is
-  # ~187 MB moving through it. It is not held -- COPY TO STDOUT means no row ever
-  # becomes a Python object (see the handler's docstring), which is what makes
-  # this size about throughput rather than about capacity.
-  memory_size = 3008
+  # 10,240 MB, the Lambda maximum, raised from 3008 and before that from 512.
+  #
+  # Not for capacity, and the measurement says so: a whole-portfolio extract moved
+  # 177 MB through this function and it reported Max Memory Used of 130-131 MB.
+  # COPY TO STDOUT means no row ever becomes a Python object (see the handler's
+  # docstring), so the result set is never held -- the bytes pass through a 16 MB
+  # buffer on their way to S3.
+  #
+  # It is for the two things memory is really the dial for on Lambda. vCPU: the
+  # remaining cost on this path is pg8000 framing CopyData messages off a TLS
+  # socket in pure Python, which is single-threaded work that scales with clock
+  # rather than cores, and 3008 MB is about two vCPU. Network: Lambda's bandwidth
+  # allocation rises with memory, and this function is one long read and one long
+  # write. Post-COPY throughput measured 6.65 MB/s against a server that scans and
+  # joins the same 878,317 rows in 6.7 seconds, so the gap is still this side of
+  # the socket.
+  #
+  # Lambda bills GB-milliseconds, so this is 3.4x the rate of 3008. It is close to
+  # cost-neutral if the duration falls in proportion and a few tenths of a cent per
+  # question if it does not.
+  memory_size = 10240
 
   environment {
     variables = merge(local.lambda_db_env, {

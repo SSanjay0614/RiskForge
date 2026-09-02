@@ -48,6 +48,7 @@ from riskforge import credit, inputs, outputs, rates  # noqa: E402
 from utils.logger import logger  # noqa: E402
 
 MODES = ("score", "rates")
+SCORING_MODES = ("local", "endpoint")
 
 
 def parse_args(argv):
@@ -82,6 +83,16 @@ def parse_args(argv):
         "--workers", type=int, default=int(os.environ.get("WORKERS") or 0),
         help="Concurrent endpoint requests. 0 uses the endpoint's max_concurrency.",
     )
+    # Where PD and LGD are computed. "local" runs the endpoints' own artifacts
+    # through the endpoints' own handler in this process; "endpoint" sends the
+    # portfolio to SageMaker. Default local because that is what the deployed
+    # pipeline uses -- 880 requests at five concurrent was most of the latency --
+    # and "endpoint" is kept because it is the fallback that needs no rebuild.
+    parser.add_argument(
+        "--scoring", choices=SCORING_MODES,
+        default=os.environ.get("SCORING_MODE", "local"),
+        help="local = boosters in this process. endpoint = SageMaker Runtime.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -92,64 +103,174 @@ def parse_args(argv):
         problems.append("--source-uri is required (or SOURCE_URI)")
     if not args.output_uri:
         problems.append("--output-uri is required (or OUTPUT_URI)")
-    if args.mode == "score" and not (args.pd_endpoint and args.lgd_endpoint):
+    if args.scoring not in SCORING_MODES:
+        problems.append("--scoring must be one of %s (or SCORING_MODE)" % (SCORING_MODES,))
+    # Required in endpoint mode only. In local mode the names are recorded as
+    # provenance rather than called, so a missing one is not a reason to refuse to
+    # score -- but they are passed anyway by both Step Functions branches.
+    if args.mode == "score" and args.scoring == "endpoint" \
+            and not (args.pd_endpoint and args.lgd_endpoint):
         problems.append("--pd-endpoint and --lgd-endpoint are required in score mode "
-                        "(or PD_ENDPOINT / LGD_ENDPOINT)")
+                        "with --scoring endpoint (or PD_ENDPOINT / LGD_ENDPOINT)")
     if problems:
         parser.error("; ".join(problems))
 
     return args
 
 
-def main(argv=None):
-    args = parse_args(argv if argv is not None else sys.argv[1:])
+def compute(args):
+    """
+    The work, with no process or transport in it: read, branch, write, return the
+    URI. Shared by the CLI entrypoint and the Lambda handler so that the two
+    cannot drift -- everything above this line is argument handling and everything
+    below is how the caller reports failure.
+    """
     started = dt.datetime.now(dt.timezone.utc)
     out_bucket, out_key = inputs.parse_uri(args.output_uri)
 
-    logger.info("task | mode=%s source=%s output=%s"
-                % (args.mode, args.source_uri, args.output_uri))
+    raw_df = inputs.load_query_result(args.source_uri)
+
+    if args.mode == "score":
+        payload = credit.run(
+            raw_df, args.pd_endpoint, args.lgd_endpoint,
+            batch_rows=args.batch_rows or None, workers=args.workers or None,
+            scoring=args.scoring,
+        )
+    else:
+        payload = rates.run(raw_df)
+
+    envelope = outputs.envelope(
+        args.mode, args.source_uri, payload, started, len(raw_df))
+    return outputs.write(envelope, out_bucket, out_key), started, len(raw_df)
+
+
+def write_failure(args, exc, started):
+    """
+    The failure, written to the output key as well as raised.
+
+    The reason has to be somewhere the state machine can read: a Fargate task
+    returns only an exit code, and a Lambda's error payload is truncated and
+    carries no context about which query it was computing. CloudWatch Logs is not
+    that place either, because a state machine cannot read it. So the object at the
+    output key is either a result or an explanation, and never absent.
+    """
+    out_bucket, out_key = inputs.parse_uri(args.output_uri)
+    failure = {
+        "mode": args.mode,
+        "success": False,
+        "source_uri": args.source_uri,
+        "error": "%s: %s" % (type(exc).__name__, exc),
+        "started_at": started.isoformat(),
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    try:
+        outputs.write(failure, out_bucket, out_key)
+    except Exception as write_failure_exc:
+        # Best effort by definition: if S3 is the thing that is broken, the raised
+        # exception is all there is, and saying so beats a traceback about the
+        # error handler.
+        logger.error("task | could not write the failure result | %s" % write_failure_exc)
+
+
+def main(argv=None):
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    started = dt.datetime.now(dt.timezone.utc)
+
+    logger.info("task | mode=%s scoring=%s source=%s output=%s"
+                % (args.mode, args.scoring, args.source_uri, args.output_uri))
 
     try:
-        raw_df = inputs.load_query_result(args.source_uri)
-
-        if args.mode == "score":
-            payload = credit.run(
-                raw_df, args.pd_endpoint, args.lgd_endpoint,
-                batch_rows=args.batch_rows or None, workers=args.workers or None,
-            )
-        else:
-            payload = rates.run(raw_df)
-
-        envelope = outputs.envelope(
-            args.mode, args.source_uri, payload, started, len(raw_df))
-        uri = outputs.write(envelope, out_bucket, out_key)
-
+        uri, _, _ = compute(args)
     except Exception as exc:
-        # The failure is written to the output key as well as logged. Step
-        # Functions sees a non-zero exit and can Catch on it, but the exit code
-        # says only that the task failed -- the reason has to be somewhere the
-        # state machine can read, and CloudWatch Logs is not that place.
+        # Step Functions sees a non-zero exit and can Catch on it, but the exit
+        # code says only that the task failed.
         logger.error("task | %s | %s" % (type(exc).__name__, exc))
         traceback.print_exc()
-        failure = {
-            "mode": args.mode,
-            "success": False,
-            "source_uri": args.source_uri,
-            "error": "%s: %s" % (type(exc).__name__, exc),
-            "started_at": started.isoformat(),
-            "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        }
-        try:
-            outputs.write(failure, out_bucket, out_key)
-        except Exception as write_failure:
-            # Best effort by definition: if S3 is the thing that is broken, the
-            # exit code is all there is, and saying so beats a traceback about
-            # the error handler.
-            logger.error("task | could not write the failure result | %s" % write_failure)
+        write_failure(args, exc, started)
         return 1
 
     print(uri)
     return 0
+
+
+def handler(event, context):
+    """
+    The same work as a container-image Lambda, which is how both Step Functions
+    branches now run it.
+
+    Why not Fargate any more: a task spends 21-49 seconds attaching an ENI and
+    pulling a 150 MB image before any of this file executes, and `ecs:runTask.sync`
+    then waits through a further 24-29 seconds of teardown after the result is
+    already in S3. Measured across five task lifecycles, the rates branch ran for
+    3.2 seconds inside a state that took 52.8. Here there is no ENI at all -- these
+    two functions are not VPC-attached, because they reach only S3 and SageMaker
+    Runtime and both are public AWS API endpoints (see infra/lambda_risk.tf) -- the
+    image layers are cached rather than pulled per request, and a warm environment
+    keeps the two loaded boosters between questions.
+
+    **The S3 contract is unchanged, deliberately.** This writes the same object, at
+    the same key, in the same envelope shape, so ReadCreditResult, ReadRatesResult
+    and everything downstream of them did not have to change -- the state machine
+    diff is the compute resource and nothing else. What comes back here is only the
+    URI and the row count, well inside the 256 KB state limit, and no per-loan
+    field can appear in it because outputs.check refuses to write one in the first
+    place.
+
+    Raising rather than returning an error: Step Functions distinguishes a failed
+    Lambda from a successful one by the raise, so a returned {"success": false}
+    would let a broken branch look like a completed one and carry an empty result
+    into Compliance. The explanation still reaches S3, at the output key, because
+    write_failure puts it there before this re-raises.
+    """
+    event = event or {}
+    argv = []
+    for flag, key in (
+        ("--mode", "mode"),
+        ("--source-uri", "source_uri"),
+        ("--output-uri", "output_uri"),
+        ("--pd-endpoint", "pd_endpoint"),
+        ("--lgd-endpoint", "lgd_endpoint"),
+        ("--scoring", "scoring"),
+        ("--batch-rows", "batch_rows"),
+        ("--workers", "workers"),
+    ):
+        value = event.get(key)
+        if value not in (None, ""):
+            argv.extend([flag, str(value)])
+
+    # Through the same parser as the CLI, so the event is validated by the same
+    # rules and a missing mode is still an error rather than a default. argparse
+    # calls sys.exit on a bad argument, which inside a Lambda is a SystemExit --
+    # caught below and turned into a raise with the usage message attached, because
+    # a bare SystemExit in the logs says nothing about what was wrong.
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        raise ValueError(
+            "invalid task event: %s. Expected mode, source_uri and output_uri; "
+            "got keys %s." % (exc, sorted(event.keys()))
+        ) from exc
+
+    started = dt.datetime.now(dt.timezone.utc)
+    logger.info("task | lambda | mode=%s scoring=%s source=%s output=%s"
+                % (args.mode, args.scoring, args.source_uri, args.output_uri))
+
+    try:
+        uri, _, row_count = compute(args)
+    except Exception as exc:
+        logger.error("task | %s | %s" % (type(exc).__name__, exc))
+        traceback.print_exc()
+        write_failure(args, exc, started)
+        raise
+
+    return {
+        "mode": args.mode,
+        "success": True,
+        "result_uri": uri,
+        "row_count": row_count,
+        "elapsed_ms": int(
+            (dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000),
+    }
 
 
 if __name__ == "__main__":

@@ -45,8 +45,29 @@ variable "db_engine_version" {
 variable "db_instance_class" {
   description = <<-EOT
     db.t4g.micro: Graviton, 2 vCPU burstable, 1 GiB RAM, ~$0.016/hour in
-    us-east-1, and one of the two classes the AWS free plan covers. Enough for
-    a 1 GiB static snapshot read by one app.
+    us-east-1.
+
+    Not a choice -- a ceiling. db.t4g.medium was attempted and RDS refused it:
+    `FreeTierRestrictionError: This instance size isn't available with free plan
+    accounts.` The free account plan permits only the micro classes, and the
+    documented way past it is `aws freetier upgrade-account-plan`, which this
+    project does not run. So the database stays at 1 GiB however much the workload
+    would like more.
+
+    What that costs is measured. On the full-portfolio run, `ExecuteSQL` is the
+    largest state in the pipeline at 22.86 seconds, and its Lambda REPORT puts the
+    time in the query rather than the function: 634 ms of init and 152 MB of
+    10240 MB used, because the result streams to S3 and is never materialised.
+    Underneath it, the instance had 102 MB of freeable memory out of 1 GiB and the
+    878k x 878k hash join was spilling to temporary files at 340 read IOPS -- with
+    shared_buffers pinned at 25% of 1 GiB by the RDS formula, roughly 256 MB. The
+    two runs also drew CPUCreditBalance from full to 0, which is not a throttle
+    while it lasts but is a hard limit on how many questions in a row keep this
+    speed.
+
+    Because RAM is fixed, the tuning moved into aws_db_parameter_group.postgres
+    instead: work_mem and hash_mem_multiplier, which decide how much of that join
+    spills. See the parameters in rds.tf.
   EOT
   type        = string
   default     = "db.t4g.micro"
@@ -338,14 +359,24 @@ variable "lambda_agent_memory" {
 
 variable "risk_image_tag" {
   description = <<-EOT
-    Tag of the image the task definition runs. `latest` by default, which is what
-    Deploy/fargate/build_and_push.py re-points on every push -- so a rebuild
-    reaches the next task run without a Terraform apply.
+    Tag of the risk image. `latest` by default, which is what
+    Deploy/fargate/build_and_push.py re-points on every push.
+
+    The two runtimes resolve that tag at different moments, and the difference
+    matters. ECS resolves it when a task launches, so a rebuild reaches the next
+    run on its own. Lambda resolves it to a digest when the function is created or
+    updated, and `image_uri` here is textually identical after a re-push -- so
+    Terraform sees no diff, does nothing, and the functions keep running the
+    previous build. A rebuild reaches Lambda only with an apply that changes this
+    string.
 
     Every push also gets an immutable tag: the first 12 characters of the SHA-256
     of the build manifest, which is a digest of every file that went into the
-    image. Set this to one of those to pin a task definition to a specific build,
-    which is what you want if a number ever needs reproducing months later.
+    image. So the rebuild sequence for the Lambda path is
+    `terraform apply -var risk_image_tag=<that tag>`, which both moves the
+    functions to the new build and records in state exactly which build answered a
+    question -- which is what you want if a number ever needs reproducing months
+    later.
   EOT
   type        = string
   default     = "latest"
@@ -528,4 +559,130 @@ variable "rds_low_memory_threshold_bytes" {
   EOT
   type        = number
   default     = 41943040
+}
+
+variable "risk_lambda_memory_mb" {
+  description = <<-EOT
+    Memory for the score branch, in MB. 10,240 -- the Lambda maximum -- and the
+    reason is vCPU rather than capacity.
+
+    Memory and cores are one dial on Lambda: 10,240 MB is roughly six vCPU, and
+    with the endpoint round trips gone the longest remaining step is pandas
+    feature engineering over 878,317 rows, which is single-threaded and wants
+    clock speed more than parallelism. Capacity matters as well -- the engineered
+    frame plus the get_dummies intermediates peak near 3 GB on the whole book --
+    but 3 GB is what makes this size safe, not what makes it necessary.
+
+    Lambda bills per GB-millisecond, so this is not free: the ceiling costs about
+    five times what 2 GB would for the same wall clock. It buys wall clock, which
+    is the thing being optimised, and a whole-portfolio question at this size
+    costs well under a cent.
+
+    Whether it is enough stops being a guess on the first run: every REPORT line
+    carries Max Memory Used, which the Fargate task never reported because
+    Container Insights is disabled.
+  EOT
+  type        = number
+  default     = 10240
+}
+
+variable "rates_lambda_memory_mb" {
+  description = <<-EOT
+    Memory for the rates branch, in MB. 4096, and it is sized for the read rather
+    than the arithmetic.
+
+    The work is three pandas aggregations, measured at 3.2 seconds inside a
+    52.8-second Fargate state. What it cannot avoid is holding the whole raw frame:
+    inputs.py reads the query result whole on purpose, because RepricingGapTool
+    takes its reporting date from the maximum issue_date across the entire
+    population and ConcentrationTool needs every segment total, so neither tool is
+    correct on a chunk. That frame is roughly 300 MB on the full book, and 4096
+    leaves room for the CSV parse that produces it, which transiently costs more
+    than the frame itself.
+
+    Deliberately not the 10,240 the score branch takes. This branch is not
+    CPU-bound, so paying for six vCPU would buy nothing but a larger bill on the
+    branch that was never the problem.
+  EOT
+  type        = number
+  default     = 4096
+}
+
+variable "risk_lambda_timeout" {
+  description = <<-EOT
+    Seconds either risk function may run. 900, the Lambda hard maximum.
+
+    Not a budget. The work is 15-25 seconds warm, and the number that decides when
+    to give up on a question is pipeline_task_timeout on the state machine. This
+    is the wall that catches a failure the inner limits cannot see, and it has to
+    sit inside pipeline_task_timeout (1800) so a stuck branch is reported as a
+    branch failure that names the branch rather than as an execution timeout that
+    names nothing.
+  EOT
+  type        = number
+  default     = 900
+}
+
+variable "risk_scoring_mode" {
+  description = <<-EOT
+    Where PD and LGD are computed. Passed to the container as SCORING_MODE.
+
+      local     the endpoints own artifacts, through the endpoints own handler,
+                in the Lambda process
+      endpoint  over SageMaker Runtime, as it was
+
+    local, because the endpoints were never the slow part and the traffic shape
+    was. ModelLatency measured 78-177 ms, but the whole book is 878,317 rows,
+    which is about 880 HTTPS round trips across the two models, and
+    L-96300102 pins concurrency at 5 -- so roughly 176 sequential waves, each
+    paying an OverheadLatency of 5.4-6.6 seconds on a cold endpoint.
+
+    Identical numbers, and structurally rather than by comparison:
+    Deploy/fargate/stage.py extracts booster.json, calibration.json and
+    manifest.json out of the same model.tar.gz bundles the endpoints serve, and
+    refuses to build if the code/inference.py packaged inside them differs by a
+    byte from Deploy/sagemaker/inference.py. So the local path reuses the deployed
+    artifacts and the deployed handler, and differs from the endpoint path in
+    transport and nothing else. Deploy/fargate/verify_local_scoring.py replays the
+    same 64 reference vectors verify_endpoints.py uses and passes at zero
+    tolerance on both models.
+
+    Set this to endpoint to put the traffic back on SageMaker with no rebuild and
+    no state machine edit -- the image, the IAM grant and both endpoints are all
+    still in place for exactly that. Note that the endpoint fallback works from
+    Lambda because these functions are not VPC-attached; there is no SageMaker
+    Runtime interface endpoint and no NAT.
+  EOT
+  type        = string
+  default     = "local"
+
+  validation {
+    condition     = contains(["local", "endpoint"], var.risk_scoring_mode)
+    error_message = "risk_scoring_mode must be local or endpoint (see SCORING_MODES in Deploy/fargate/task.py)."
+  }
+}
+
+variable "risk_lambda_tmp_mb" {
+  description = <<-EOT
+    Ephemeral /tmp for both risk functions, in MB. 2048, against a default of 512.
+
+    /tmp is used rather than incidental on this path:
+    inputs.load_query_result stages the S3 object through a NamedTemporaryFile
+    before read_csv sees it, so that a mid-transfer failure on a 300 MB object is a
+    retryable download rather than a half-built DataFrame, and so read_csv is
+    handed a seekable file -- which is what low_memory=False needs to infer column
+    types in one pass.
+
+    The whole book is roughly 177 MB of CSV, so 512 would hold it. The number that
+    sets this is inputs.MAX_ROWS, 1.2 million rows: a wider result than the entire
+    portfolio, and around 250 MB. The margin above that is for a warm execution
+    environment, where /tmp carries over between invocations -- inputs.py unlinks
+    in a finally block, so nothing should be left behind, and this is the room for
+    the case where something is.
+
+    Storage above the free 512 MB bills per GB-second at a rate that is a rounding
+    error next to the memory these functions already hold.
+  EOT
+  type        = number
+  default     = 2048
 }

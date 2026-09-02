@@ -1,5 +1,5 @@
 # The pipeline as one state machine: guard, generate, execute, evaluate, fan out
-# to the two Fargate risk agents, then the compliance check.
+# to the two risk agents, then the compliance check.
 #
 # The definition is a separate file rather than a jsonencode() here, because a
 # 380-line state machine inside HCL is a state machine nobody reads. Every ARN,
@@ -23,6 +23,18 @@ locals {
     execute_sql_arn = aws_lambda_function.execute_sql.arn
     compliance_arn  = aws_lambda_function.compliance_check.arn
 
+    # The two risk agents. Container-image Lambdas running the identical image
+    # the task definition below still points at -- see lambda_risk.tf for the
+    # measurement that moved them off ecs:runTask.sync.
+    risk_score_arn = aws_lambda_function.risk_score.arn
+    risk_rates_arn = aws_lambda_function.risk_rates.arn
+
+    # Kept, and currently unreferenced by the ASL. These are what an
+    # ecs:runTask.sync branch needs, and leaving them wired means the revert is
+    # an edit to pipeline.asl.json alone -- no Terraform change, no rebuild,
+    # because entry.sh makes one image serve both runtimes. templatefile()
+    # requires a value for every variable the template references and does not
+    # object to one it does not.
     cluster_arn = aws_ecs_cluster.risk.arn
     # Revision included, deliberately: the state machine names the exact task
     # definition it was applied against, so a change to the container's CPU,
@@ -72,7 +84,7 @@ resource "aws_sfn_state_machine" "pipeline" {
     include_execution_data = false
   }
 
-  # No X-Ray. It bills per trace and would report the latency of five Lambda
-  # invocations and two Fargate tasks -- which is what the execution history
-  # already shows, per state, with the input and output attached.
+  # No X-Ray. It bills per trace and would report the latency of seven Lambda
+  # invocations -- which is what the execution history already shows, per state,
+  # with the input and output attached.
 }

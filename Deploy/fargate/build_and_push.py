@@ -172,9 +172,14 @@ def main():
     print("size      %.0f MB compressed" % (images["imageSizeInBytes"] / 1024 / 1024))
     print("latest    also points here")
     print()
-    print("The task definition follows :latest, so the next run picks this up "
-          "with no Terraform apply. To pin it instead, set risk_image_tag = "
-          "\"%s\" in infra/terraform.tfvars." % tag)
+    print("The ECS task definition follows :latest and resolves it at launch, so "
+          "a task run picks this up on its own.")
+    print("The two risk Lambda functions do NOT. Lambda resolves a tag to a digest "
+          "when the function is created or updated, and image_uri is textually "
+          "unchanged after a re-push -- so Terraform sees no diff and they keep "
+          "running the previous build. To move them to this one:")
+    print()
+    print("    cd infra && terraform apply -var risk_image_tag=\"%s\"" % tag)
     return 0
 
 

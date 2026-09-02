@@ -32,7 +32,6 @@ from tools.regulatory_capital_tool import RegulatoryCapitalTool
 from utils.logger import logger
 
 from . import features
-from .scoring import Scorer
 
 # Reported alongside the count-based distribution because they answer different
 # questions: 40% of loans in the Low tier and 40% of exposure in the Low tier are
@@ -65,10 +64,18 @@ def _exposure_by_tier(scored_df):
     return out
 
 
-def run(raw_df, pd_endpoint, lgd_endpoint, batch_rows=None, workers=None):
+def run(raw_df, pd_endpoint, lgd_endpoint, batch_rows=None, workers=None,
+        scoring="local"):
     """
     {"credit_metrics": {...}, "regulatory_capital": {...}} -- or credit_metrics
     empty with a reason, if nothing survived to score.
+
+    `scoring` picks where PD and LGD are computed: "local" runs the endpoints' own
+    artifacts through the endpoints' own handler in this process, "endpoint" sends
+    them to SageMaker. The two produce the same numbers -- see
+    riskforge/scoring_local.py, which explains why that is structural rather than
+    a coincidence -- and differ only in whether the whole portfolio crosses the
+    network 880 times.
 
     Returning an empty dict rather than raising on an empty population is carried
     across from CreditRiskAgent, and it is the right behaviour for the same
@@ -95,7 +102,16 @@ def run(raw_df, pd_endpoint, lgd_endpoint, batch_rows=None, workers=None):
         kwargs["batch_rows"] = batch_rows
     if workers:
         kwargs["workers"] = workers
-    scorer = Scorer(pd_endpoint, lgd_endpoint, **kwargs)
+    # Imported here rather than at module scope so that the endpoint path does not
+    # need xgboost installed, and the local path does not need a container that
+    # happens to carry the model artifacts. Whichever one is not selected is never
+    # imported.
+    if scoring == "local":
+        from .scoring_local import LocalScorer
+        scorer = LocalScorer(pd_endpoint, lgd_endpoint)
+    else:
+        from .scoring import Scorer
+        scorer = Scorer(pd_endpoint, lgd_endpoint, **kwargs)
     el = scorer.score(engineered)
 
     logger.info(
@@ -119,6 +135,9 @@ def run(raw_df, pd_endpoint, lgd_endpoint, batch_rows=None, workers=None):
     credit_metrics["exposure_by_risk_tier"] = _exposure_by_tier(el.scored_df)
     credit_metrics["pd_endpoint"] = pd_endpoint
     credit_metrics["lgd_endpoint"] = lgd_endpoint
+    # Which transport produced the numbers, recorded next to them. The artifacts
+    # and the handler are the same either way, so this is provenance, not a caveat.
+    credit_metrics["scoring_mode"] = scoring
 
     return {
         "credit_metrics": credit_metrics,

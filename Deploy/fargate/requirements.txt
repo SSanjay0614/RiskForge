@@ -36,3 +36,22 @@ python-dotenv==1.0.1
 # Pinned for the same reason as the rest: an image that builds a different
 # dependency set tomorrow is not the image that was verified today.
 boto3==1.35.36
+
+# The PD and LGD boosters, run in this process instead of over 880 HTTPS requests
+# to the endpoints -- see riskforge/scoring_local.py. Pinned to the version
+# build_artifacts.py recorded in each manifest's trained_with, which is the
+# version that produced the reference vectors the artifacts were verified against.
+#
+# Only xgboost, and deliberately not scikit-learn: the artifacts are XGBoost's own
+# JSON model format plus JSON sidecars, so nothing here unpickles a fitted
+# estimator. The isotonic calibration travels as 227 (x, y) knots and np.interp
+# reproduces IsotonicRegression(out_of_bounds="clip") exactly.
+xgboost==2.1.4
+
+# The Lambda Runtime Interface Client, which is what lets this image run as a
+# container-image Lambda without changing its base image away from python:3.9.
+# The base image is part of the numerical contract -- see the Dockerfile -- so
+# adding the runtime client to it is the right direction, and an AWS-published
+# python3.9 Lambda base image is a deprecated runtime besides. entry.sh dispatches
+# on AWS_LAMBDA_RUNTIME_API, so the same image still runs as a Fargate task.
+awslambdaric==3.0.0

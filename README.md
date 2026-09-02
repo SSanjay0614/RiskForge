@@ -72,6 +72,36 @@ The system distinguishes between queries that need full risk analysis and querie
 | Plotly | Interactive risk visualizations |
 | pandas / NumPy | Feature engineering and financial calculations |
 
+---
+
+## ☁️ RiskForge on AWS
+
+The same platform has been rebuilt as an **AWS-native deployment** — identical
+models and identical risk mathematics, re-expressed entirely in managed services
+and defined in Terraform, with no console clicks. SQLite became **RDS
+PostgreSQL** (878,317 loans across normalised tables), the local LLM became the
+**Gemini API** behind Lambda, LangGraph's orchestration became a **Step Functions**
+state machine whose execution history is the audit trail, the two risk agents
+became **container-image Lambda functions** running as a true parallel fan-out,
+and the models are served from **SageMaker Serverless Inference**.
+
+The whole-portfolio question — every one of the 878,317 loans extracted and
+scored live, with no precomputation — originally took **over 3 minutes** end to
+end. It now runs in **under a minute**: 209.5s → **60.8s**, achieved by replacing
+per-request Fargate tasks with container-image Lambda, moving PD and LGD scoring
+in-process to eliminate ~880 sequential HTTPS round trips, and widening the S3
+extract — without changing a single model output, which is verified to zero
+tolerance.
+
+→ **[AWS_NATIVE_REBUILD.md](AWS_NATIVE_REBUILD.md)** — architecture, pipeline,
+services in use, security posture and the infrastructure-as-code layout
+
+→ **[AWS_LATENCY_TUNING.md](AWS_LATENCY_TUNING.md)** — the full latency
+measurement record, change by change
+
+Everything below this point describes running RiskForge **locally**.
+
+
 ## 🚀 Getting Started
 
 ### Clone the Repository

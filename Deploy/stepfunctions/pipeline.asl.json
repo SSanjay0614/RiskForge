@@ -1,5 +1,5 @@
 {
-  "Comment": "RiskForge: question -> guard -> SQL -> execute -> evaluate -> fan out to two Fargate risk agents -> compliance. Rendered from this file by infra/stepfunctions.tf; every ARN, subnet and bucket name is a Terraform value, so nothing here is copied by hand.",
+  "Comment": "RiskForge: question -> guard -> SQL -> execute -> evaluate -> fan out to two risk agents -> compliance. Rendered from this file by infra/stepfunctions.tf; every ARN, subnet and bucket name is a Terraform value, so nothing here is copied by hand.",
   "StartAt": "Init",
   "TimeoutSeconds": ${execution_timeout},
   "States": {
@@ -298,7 +298,7 @@
     },
     "NeedsRiskAnalysis": {
       "Type": "Choice",
-      "Comment": "The guard already decided this. A question like 'how many loans are in sub-grade B3' has its answer in the query result, and running two Fargate tasks to restate a row count would cost half a minute and a SageMaker invocation per loan to add nothing.",
+      "Comment": "The guard already decided this. A question like 'how many loans are in sub-grade B3' has its answer in the query result, and running the two risk agents to restate a row count would add nothing at the cost of the two slowest states in the pipeline.",
       "Choices": [
         {
           "Variable": "$.guard.Payload.requires_risk_analysis",
@@ -347,7 +347,7 @@
     },
     "FanOut": {
       "Type": "Parallel",
-      "Comment": "The two risk agents, started at the same time on separate infrastructure. Both read the query result and neither reads the other's output, so the wall clock is the slower branch rather than the sum -- about 26 seconds for scoring against 0.6 for rates. Same image, same task definition, different --mode.",
+      "Comment": "The two risk agents, started at the same time. Both read the query result and neither reads the other's output, so the wall clock is the slower branch rather than the sum. Same image, same digest, different mode in the payload -- and the same image the ECS task definition still points at, which is what makes the move back to ecs:runTask an edit to this file rather than a rebuild.",
       "ResultPath": "$.branches",
       "Branches": [
         {
@@ -355,38 +355,35 @@
           "States": {
             "ScoreLoans": {
               "Type": "Task",
-              "Comment": "Feature engineering, PD and LGD from the two endpoints, Expected Loss, Basel III RWA. The Retry below covers capacity and throttling only: a task that started and exited non-zero raises States.TaskFailed and is deliberately not retried, because the input is unchanged and the second run would fail the same way after another 26 seconds of scoring.",
-              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Comment": "Feature engineering, PD, LGD, Expected Loss, Basel III RWA. A container-image Lambda running the same image the ECS task definition still points at, because the state before this one was 116.6 seconds around a container that ran for 40.2: ~21-49s of ENI attach and image pull before any code ran, then 24-29s of teardown that runTask.sync waits through after the result is already in S3. The Retry covers capacity and throttling only -- a handler that raised is not retried, because the input is unchanged and the second run fails the same way after another 25 seconds of scoring.",
+              "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "Cluster": "${cluster_arn}",
-                "TaskDefinition": "${task_definition_arn}",
-                "LaunchType": "FARGATE",
-                "NetworkConfiguration": {
-                  "AwsvpcConfiguration": {
-                    "Subnets": ${subnets_json},
-                    "SecurityGroups": ${security_groups_json},
-                    "AssignPublicIp": "ENABLED"
-                  }
-                },
-                "Overrides": {
-                  "ContainerOverrides": [
-                    {
-                      "Name": "${container_name}",
-                      "Command.$": "States.Array('--mode', 'score', '--source-uri', $.source_uri, '--output-uri', $.credit_uri)"
-                    }
-                  ]
+                "FunctionName": "${risk_score_arn}",
+                "Payload": {
+                  "mode": "score",
+                  "source_uri.$": "$.source_uri",
+                  "output_uri.$": "$.credit_uri"
                 }
               },
               "TimeoutSeconds": ${task_timeout},
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "ECS.AmazonECSException",
-                    "ECS.ServerException",
-                    "ECS.ThrottlingException"
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
                   ],
-                  "IntervalSeconds": 5,
+                  "IntervalSeconds": 2,
                   "MaxAttempts": 2,
+                  "BackoffRate": 2
+                },
+                {
+                  "ErrorEquals": [
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "Comment": "Separate and slower, because this one is expected rather than exceptional: Service Quotas L-B99A9384 is 10 concurrent executions on this account against a published default of 1000, and the fan-out takes two of them per question. Backing off and retrying is the difference between a busy moment and a failed run.",
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 4,
                   "BackoffRate": 2
                 }
               ],
@@ -395,7 +392,7 @@
             },
             "ReadCreditResult": {
               "Type": "Task",
-              "Comment": "A Fargate task returns an exit code, not a payload, so the aggregates come back the way they left: from the object the task wrote. GetObject through the SDK integration means no glue Lambda exists to read one JSON file.",
+              "Comment": "The aggregates come back the way they left: from the object the branch wrote. The handler does return a payload now that this is a Lambda, but ResultPath is null on the state above and this reads S3 anyway -- deliberately, on two grounds. The object is the audit trail for what a run reported, and keeping the contract identical is why nothing downstream of here changed when the compute did. GetObject through the SDK integration means no glue Lambda exists to read one JSON file.",
               "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
               "Parameters": {
                 "Bucket": "${bucket}",
@@ -421,38 +418,34 @@
           "States": {
             "MeasureRates": {
               "Type": "Task",
-              "Comment": "Repricing gap and HHI by purpose and by state, on the raw rows -- feature engineering would have encoded away the columns this branch segments on.",
-              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Comment": "Repricing gap and HHI by purpose and by state, on the raw rows -- feature engineering would have encoded away the columns this branch segments on. This is the branch that made the case for the move: the container did its work in 3.2 seconds inside a state that took 52.8, so 94% of that state was a container lifecycle rather than arithmetic.",
+              "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "Cluster": "${cluster_arn}",
-                "TaskDefinition": "${task_definition_arn}",
-                "LaunchType": "FARGATE",
-                "NetworkConfiguration": {
-                  "AwsvpcConfiguration": {
-                    "Subnets": ${subnets_json},
-                    "SecurityGroups": ${security_groups_json},
-                    "AssignPublicIp": "ENABLED"
-                  }
-                },
-                "Overrides": {
-                  "ContainerOverrides": [
-                    {
-                      "Name": "${container_name}",
-                      "Command.$": "States.Array('--mode', 'rates', '--source-uri', $.source_uri, '--output-uri', $.rates_uri)"
-                    }
-                  ]
+                "FunctionName": "${risk_rates_arn}",
+                "Payload": {
+                  "mode": "rates",
+                  "source_uri.$": "$.source_uri",
+                  "output_uri.$": "$.rates_uri"
                 }
               },
               "TimeoutSeconds": ${task_timeout},
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "ECS.AmazonECSException",
-                    "ECS.ServerException",
-                    "ECS.ThrottlingException"
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                },
+                {
+                  "ErrorEquals": [
+                    "Lambda.TooManyRequestsException"
                   ],
                   "IntervalSeconds": 5,
-                  "MaxAttempts": 2,
+                  "MaxAttempts": 4,
                   "BackoffRate": 2
                 }
               ],

@@ -77,6 +77,7 @@ import re
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "shared"))
 
@@ -92,7 +93,27 @@ RESULTS_PREFIX = os.environ.get("RESULTS_PREFIX", "query-results")
 # than a refused query.
 DEFAULT_MAX_ROWS = 1_000_000
 DEFAULT_MAX_INLINE_ROWS = 100
-PART_SIZE = 8 * 1024 * 1024  # S3 multipart minimum is 5 MiB per part except the last
+
+# 16 MiB parts, doubled from 8. S3 requires every part except the last to be at
+# least 5 MiB and allows 10,000 of them, so neither end of that range is close.
+# The number that matters is how many sequential PutPart round trips a
+# whole-portfolio extract costs: 177 MB is 23 parts at 8 MiB and 12 at 16 MiB.
+PART_SIZE = 16 * 1024 * 1024
+
+# Parts uploaded at once, so a PutPart overlaps the next read off the socket
+# rather than stopping it.
+#
+# The read and the write were strictly alternating before this: pg8000 filled a
+# buffer, _flush blocked on one upload_part, and PostgreSQL waited on TCP
+# backpressure the whole time it took. Both halves are I/O and neither needs the
+# GIL to wait, so the pipeline was serial for no reason.
+#
+# 4 rather than more, because this bounds memory as well as parallelism: at most
+# this many parts are outstanding, so the buffered ceiling is 4 x PART_SIZE = 64
+# MB. Raising it trades that for a throughput gain that stops as soon as the
+# socket, not the upload, is the slower side. One boto3 client is shared across
+# the pool, which is how boto3's own transfer manager uses one.
+UPLOAD_WORKERS = 4
 
 # Enough of the front of the CSV to recover a small result inline without asking
 # the database a second time. 512 KB holds far more than DEFAULT_MAX_INLINE_ROWS
@@ -144,6 +165,12 @@ class _S3ByteSink:
     fixed-size parts, and keeps the first HEAD_TEE_BYTES of them so a small
     result can still be returned inline without a second query.
 
+    The parts go up on a small thread pool, so a PutPart overlaps the next read
+    off the database socket instead of stopping it -- see UPLOAD_WORKERS. Only
+    `write` and `close` are called from outside, and only ever from the one thread
+    running the COPY, so nothing here needs a lock: the workers touch no shared
+    state and hand their ETag back through a future.
+
     A byte sink rather than the csv.writer one it replaces, because nothing on
     this path builds a Python row any more -- see point 3 of the module
     docstring. `write` receives raw bytes, which is what pg8000 hands a stream
@@ -162,6 +189,13 @@ class _S3ByteSink:
         self.upload_id = _s3.create_multipart_upload(
             Bucket=bucket, Key=key, ContentType="text/csv", ServerSideEncryption="AES256"
         )["UploadId"]
+        self._pool = ThreadPoolExecutor(max_workers=UPLOAD_WORKERS)
+        # (part_number, future), oldest first. Reaped in order, so self.parts ends
+        # up in ascending part order without a sort -- which matters, because
+        # complete_multipart_upload rejects a part list that is out of order and
+        # the pool finishes parts in whatever order S3 answers.
+        self._pending = []
+        self._next_part = 1
 
     def write(self, data):
         self.buffer += data
@@ -178,21 +212,43 @@ class _S3ByteSink:
     def _flush(self):
         if not self.buffer:
             return
-        part_number = len(self.parts) + 1
+        part_number = self._next_part
+        self._next_part += 1
         payload = bytes(self.buffer)
-        etag = _s3.upload_part(
+        self.buffer = bytearray()
+        # Counted here, in the one thread that ever runs this, rather than in the
+        # worker -- so the total needs no lock and is exact whatever order the
+        # uploads finish in.
+        self.total_bytes += len(payload)
+        # Block only once there are more parts outstanding than workers to carry
+        # them. This is the backpressure that keeps the buffered ceiling at
+        # UPLOAD_WORKERS x PART_SIZE instead of at the size of the result.
+        self._reap(UPLOAD_WORKERS)
+        self._pending.append((part_number, self._pool.submit(self._upload, part_number, payload)))
+
+    def _upload(self, part_number, payload):
+        return _s3.upload_part(
             Bucket=self.bucket,
             Key=self.key,
             UploadId=self.upload_id,
             PartNumber=part_number,
             Body=payload,
         )["ETag"]
-        self.parts.append({"PartNumber": part_number, "ETag": etag})
-        self.total_bytes += len(payload)
-        self.buffer = bytearray()
+
+    def _reap(self, keep):
+        """Wait for the oldest uploads until at most `keep` are still in flight.
+
+        future.result() re-raises whatever the worker raised, in the thread that
+        called write() -- so a failed part surfaces as an exception out of the
+        COPY, which is where the handler already aborts the upload."""
+        while len(self._pending) > keep:
+            part_number, future = self._pending.pop(0)
+            self.parts.append({"PartNumber": part_number, "ETag": future.result()})
 
     def close(self):
         self._flush()
+        self._reap(0)
+        self._pool.shutdown()
         _s3.complete_multipart_upload(
             Bucket=self.bucket,
             Key=self.key,
@@ -204,6 +260,16 @@ class _S3ByteSink:
     def abort(self):
         # Without this an interrupted run leaves parts in the bucket that are
         # billed for storage and are invisible to a plain ListObjects.
+        #
+        # The pool is drained first, and waited on. An AbortMultipartUpload that
+        # races an in-flight PutPart is how a part outlives the upload it belonged
+        # to -- orphaned, billed, and unreachable by the very cleanup that was
+        # trying to remove it. Waiting can cost the remainder of one part upload;
+        # that is the price of the guarantee.
+        try:
+            self._pool.shutdown(wait=True)
+        except Exception:
+            pass
         try:
             _s3.abort_multipart_upload(
                 Bucket=self.bucket, Key=self.key, UploadId=self.upload_id

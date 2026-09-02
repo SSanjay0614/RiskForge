@@ -1,5 +1,8 @@
-# The state machine's execution role. It calls five Lambda functions, runs one
-# task definition on one cluster, and reads the two objects that task writes.
+# The state machine's execution role. It calls seven Lambda functions -- five zip
+# functions and the two container-image risk agents -- and reads the two objects
+# those agents write. It also keeps the ecs:RunTask grant, unused while the
+# branches are Lambdas and kept so the revert in lambda_risk.tf needs no IAM
+# change.
 # Nothing in it can reach the database, a secret, the query-results prefix, or a
 # SageMaker endpoint -- the states it orchestrates hold those permissions
 # themselves, and the orchestrator does not inherit them.
@@ -29,15 +32,23 @@ resource "aws_iam_role_policy" "sfn_inline" {
     Version = "2012-10-17"
     Statement = [
       {
-        # The five functions by ARN. The :* suffix covers published versions and
-        # aliases of the same function, which is what a lambda:invoke task
-        # resolves when a version is ever pinned.
+        # The seven functions by ARN, enumerated rather than wildcarded on the
+        # project prefix: this role may invoke exactly the states in this
+        # pipeline, so a new function in the account is not invokable by the
+        # orchestrator until someone adds it here on purpose. The :* suffix
+        # covers published versions and aliases of the same function, which is
+        # what a lambda:invoke task resolves when a version is ever pinned.
         Sid    = "InvokeThePipelineFunctions"
         Effect = "Allow"
         Action = "lambda:InvokeFunction"
         Resource = flatten([
           for arn in concat(
-            [aws_lambda_function.execute_sql.arn, aws_lambda_function.compliance_check.arn],
+            [
+              aws_lambda_function.execute_sql.arn,
+              aws_lambda_function.compliance_check.arn,
+              aws_lambda_function.risk_score.arn,
+              aws_lambda_function.risk_rates.arn,
+            ],
             [for fn in aws_lambda_function.agent : fn.arn]
           ) : [arn, "${arn}:*"]
         ])
