@@ -253,6 +253,16 @@ def source_label(source: str) -> str:
 
 def configure_chart(figure):
     """Make a Plotly figure legible on the dark background."""
+    # title_font below creates a layout.title object whether or not the caller ever
+    # set title text, and a title carrying a font but no text reaches plotly.js as
+    # title.text === undefined -- which it draws literally, as the word "undefined"
+    # in the heading slot, in this very font. Every chart here titles itself except
+    # the per-limit compliance bar, whose heading is already the markdown line above
+    # it, so that was the only one showing it -- five times over, once per limit.
+    # Defaulting the text to empty fixes it for any future title-less chart too,
+    # and does not invent a heading for one that reads better without.
+    if figure.layout.title.text is None:
+        figure.update_layout(title_text="")
     figure.update_layout(
         dragmode=False,
         hovermode="closest",
