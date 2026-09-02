@@ -658,19 +658,73 @@ def render_response(result_state, turn_key=None, elapsed=None):
     return result_state, False
 
 
-def scroll_to_latest_message():
+def scroll_to_latest_question():
+    """Put the newest question at the top of the viewport once its answer is ready.
+
+    The previous version scrolled the last chat message into view with
+    ``block: "end"``, which lands on the *bottom* of a report several screens
+    tall: past every chart, at the download button, with the question that
+    produced it far above. Reading then starts by scrolling back up.
+
+    So the anchor is the question rather than the answer, aligned to the top.
+    Streamlit renders the pair in order, so the user's bubble is the
+    second-to-last chat message and the report begins immediately below it --
+    both the question and the first line of the answer are on screen, which is
+    where reading actually starts.
+
+    Three details that are not cosmetic:
+
+    * The clearance is measured from the live header rather than hardcoded.
+      ``[data-testid='stHeader']`` is sticky and translucent (theme.py), so a
+      plain ``block: "start"`` tucks the question underneath it.
+    * The scroll is instant, not smooth. After a 60-second analysis the viewport
+      can be thousands of pixels away, and animating that distance is a long
+      disorienting glide rather than a nicety.
+    * It runs twice, and only the second pass yields. Plotly charts in earlier
+      turns mount asynchronously and shift everything below them, so one pass can
+      land in the wrong place -- but a correction that fires while somebody is
+      already scrolling is worse than the shift it was fixing, so the first jump
+      is unconditional and the interrupt listeners are registered after it. They
+      watch wheel/touch/key rather than ``scroll``, because a programmatic scroll
+      raises ``scroll`` itself and would cancel its own retry.
+    """
     components.html(
         """
         <script>
-        const scrollLatestMessage = () => {
-            const messages = window.parent.document.querySelectorAll('[data-testid="stChatMessage"]');
-            const latest = messages[messages.length - 1];
-            if (latest) {
-                latest.scrollIntoView({ behavior: "smooth", block: "end" });
-            }
+        const win = window.parent;
+        const doc = win.document;
+        const events = ["wheel", "touchstart", "keydown"];
+
+        let interrupted = false;
+        const interrupt = () => { interrupted = true; release(); };
+        const release = () => events.forEach(
+            (event) => win.removeEventListener(event, interrupt));
+
+        const showLatestQuestion = () => {
+            const messages = doc.querySelectorAll('[data-testid="stChatMessage"]');
+            // Rendered as user bubble then assistant bubble, so the second from
+            // last is the question. The fallback covers a single message.
+            const anchor = messages[messages.length - 2]
+                        || messages[messages.length - 1];
+            if (!anchor) { return; }
+            const header = doc.querySelector('[data-testid="stHeader"]');
+            const clearance = (header ? header.getBoundingClientRect().height : 0) + 12;
+            anchor.style.scrollMarginTop = clearance + "px";
+            anchor.scrollIntoView({ behavior: "auto", block: "start" });
         };
-        setTimeout(scrollLatestMessage, 150);
-        setTimeout(scrollLatestMessage, 500);
+
+        // The first jump is the whole point, so it is unconditional; the
+        // listeners start after it, which is what makes only the correction
+        // yield to a reader who has already begun scrolling.
+        setTimeout(() => {
+            showLatestQuestion();
+            events.forEach(
+                (event) => win.addEventListener(event, interrupt, { passive: true }));
+        }, 150);
+        setTimeout(() => {
+            if (!interrupted) { showLatestQuestion(); }
+            release();
+        }, 600);
         </script>
         """,
         height=0,
@@ -766,4 +820,4 @@ if query:
             elapsed = time.perf_counter() - started
         render_response(result_state, len(st.session_state.conversation), elapsed)
     st.session_state.conversation.append({"query": query, "result": result_state, "elapsed": elapsed})
-    scroll_to_latest_message()
+    scroll_to_latest_question()
