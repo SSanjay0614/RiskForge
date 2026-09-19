@@ -2,9 +2,7 @@
 
 ### Multi-Agent Loan Portfolio Risk Intelligence System
 
-<p align="center">
-  <video src="https://github.com/SSanjay0614/RiskForge/raw/main/Docs/Risk_Forge_Demo.mp4" controls muted width="720"></video>
-</p>
+https://github.com/user-attachments/assets/3e2b213b-c081-47a9-8c1a-31a789a8c728
 
 <p align="center"><i>▶️ If the player doesn't load inline, <a href="https://github.com/SSanjay0614/RiskForge/raw/main/Docs/Risk_Forge_Demo.mp4">click here to watch the demo</a>.</i></p>
 
