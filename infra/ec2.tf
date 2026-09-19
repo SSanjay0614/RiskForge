@@ -33,3 +33,29 @@ resource "aws_instance" "app" {
     ignore_changes = [ami]
   }
 }
+
+# A permanent address for the app.
+#
+# The auto-assigned public IPv4 above is borrowed for the life of the running
+# instance: a stop/start hands back a different one, and so does a replacement.
+# That is fine for a host you reach through SSM and wrong for a link sent to
+# somebody in advance, because the link stops resolving without anything having
+# failed. An Elastic IP is held by the account rather than the instance, so the
+# address outlives a stop, a start and a rebuild.
+#
+# Cost, accurately: every public IPv4 address in AWS bills at $0.005/hour since
+# February 2024 -- attached or not, Elastic or auto-assigned. The instance is
+# already paying that for the address it borrowed, so attaching this one is a
+# swap rather than an addition. The difference is that an EIP keeps billing while
+# the instance is stopped, where the borrowed address would have been released;
+# releasing the EIP is the way to stop that, and it gives up the fixed address.
+#
+# Attaching REPLACES the auto-assigned address, so the public IP and the
+# ec2-<ip>.compute-1.amazonaws.com hostname both change once, at this apply, and
+# then stop moving.
+resource "aws_eip" "app" {
+  domain   = "vpc"
+  instance = aws_instance.app.id
+
+  tags = { Name = "${var.project}-app" }
+}

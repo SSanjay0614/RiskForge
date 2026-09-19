@@ -16,11 +16,25 @@ variable "project" {
   default     = "riskforge"
 }
 
-variable "my_ip_cidr" {
+variable "app_ingress_cidr" {
   description = <<-EOT
-    Your public IP as a /32, the only source allowed to reach the Streamlit
-    port. Home broadband IPs rotate -- if the app stops loading, re-run
-    `curl https://checkip.amazonaws.com`, update terraform.tfvars, re-apply.
+    The only source allowed to reach the Streamlit port. "0.0.0.0/0" makes the UI
+    reachable from any laptop, which is what a live demo needs -- the person
+    driving it is not on this network, and this rule was the only thing between
+    them and the app.
+
+    What that does and does not expose. The interface renders aggregates only and
+    no borrower row reaches the browser or a language model, so an anonymous
+    visitor cannot read the portfolio. What they can do is start pipeline
+    executions, and each one spends Gemini free-tier quota (20 requests a minute)
+    and RDS CPU credits -- so the cost of leaving this open is a slower demo, not
+    a disclosure. There is no authentication in front of the app; an ALB with
+    Cognito is the fix, and it is deliberately not built.
+
+    Nothing else in the stack reads this. The database accepts traffic from the
+    app security group by group ID rather than by CIDR, so widening this cannot
+    reach RDS. To narrow it back afterwards, put your own /32 here --
+    `curl https://checkip.amazonaws.com` -- and re-apply.
   EOT
   type        = string
 }
@@ -268,8 +282,8 @@ variable "gemini_model" {
     additionally gets thinkingConfig, and nothing else does (see
     shared/gemini.py, where the gate is deliberately narrow).
 
-    Gemma 4 31B is the deployed choice, and the reasons are capability and
-    headroom rather than preference:
+    Gemma 4 (the 26B a4b variant) is the deployed choice, and the reasons are
+    capability and headroom rather than preference:
 
       * It is the family the prompts were developed against. The local build runs
         gemma4 on Ollama (config.py, llm/ollama_provider.py), so the hosted model
@@ -301,6 +315,14 @@ variable "gemini_model" {
         keeping because it is the near miss: the family is available, that
         specific model is not, and probing one member of a family does not settle
         the others. gemma-4-31b-it and gemma-4-26b-a4b-it both are served.
+      * gemma-4-31b-it was the original choice but the dense 31B is too slow on
+        this key: a full guard prompt does not return inside the 20s HTTP timeout
+        in shared/gemini.py (~18s on a trivial prompt, and it now intermittently
+        500s/hangs), so all three attempts time out and the step fails with
+        GuardUnavailable. gemma-4-26b-a4b-it is the same family and free-tier
+        allowance but is the sparse a4b (~4B active) variant: the same guard
+        prompt returns in ~3s with finishReason STOP and no thinking tokens
+        burned. Same quota, no timeout -- hence the switch.
       * gemini-3.5-flash-lite works and passed the whole suite, so it stands as
         the tested fallback if the Gemma quota ever tightens -- one variable, no
         rebuild.
@@ -314,7 +336,7 @@ variable "gemini_model" {
     handlers precisely so all of that was configuration and not five rebuilds.
   EOT
   type        = string
-  default     = "gemma-4-31b-it"
+  default     = "gemma-4-26b-a4b-it"
 }
 
 variable "gemini_api_key_param" {

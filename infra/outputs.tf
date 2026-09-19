@@ -26,9 +26,23 @@ output "ec2_instance_id" {
   value       = aws_instance.app.id
 }
 
+# aws_eip.app.public_ip rather than aws_instance.app.public_ip: once an address
+# is attached, the instance attribute in state is the one it had before and stays
+# that way until the next refresh, so reading it here would print an address that
+# no longer answers.
 output "ec2_public_ip" {
-  description = "Streamlit will be at http://<this>:8501"
-  value       = aws_instance.app.public_ip
+  description = "Elastic IP of the app host -- fixed across stop/start"
+  value       = aws_eip.app.public_ip
+}
+
+output "app_url" {
+  description = "Open this in a browser. HTTP, so it will read Not secure"
+  value       = "http://${aws_eip.app.public_ip}:8501"
+}
+
+output "ec2_public_dns" {
+  description = "The same host by name, assigned by AWS at no cost"
+  value       = aws_eip.app.public_dns
 }
 
 output "app_security_group_id" {

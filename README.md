@@ -3,8 +3,11 @@
 ### Multi-Agent Loan Portfolio Risk Intelligence System
 
 <p align="center">
-  <img src="Docs/RiskForge_Architecture.png" width="600" height="750">
+  <video src="https://github.com/SSanjay0614/RiskForge/raw/main/Docs/Risk_Forge_Demo.mp4" controls muted width="720"></video>
 </p>
+
+<p align="center"><i>▶️ If the player doesn't load inline, <a href="https://github.com/SSanjay0614/RiskForge/raw/main/Docs/Risk_Forge_Demo.mp4">click here to watch the demo</a>.</i></p>
+
 RiskForge is an **agentic AI platform** that analyzes a bank's loan portfolio across credit, interest rate, concentration, and regulatory compliance risk through four specialized agents — turning a natural-language question into an **auditable, source-attributed risk report**.
 
 Built with **LangGraph, Pydantic, Streamlit, and a locally-hosted LLM (Ollama)**, RiskForge combines trained ML risk models, deterministic financial calculations, and verified Basel III regulatory logic into a single query-driven workflow — with no data ever leaving the local machine.
@@ -55,6 +58,14 @@ The system distinguishes between queries that need full risk analysis and querie
 - Behavioral PD model independently audited for data leakage (a suspiciously high initial AUC was traced, diagnosed, and fixed — see project documentation)
 - LGD target defined relative to exposure-at-default, not original loan size, per correct credit-risk methodology
 - Every Basel III formula and floor value verified directly against primary source text before implementation, not taken from memory or secondary paraphrase
+
+---
+
+## 🏗️ Architecture
+
+<p align="center">
+  <img src="Docs/RiskForge_Architecture.png" width="600">
+</p>
 
 ---
 
